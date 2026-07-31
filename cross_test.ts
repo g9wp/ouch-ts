@@ -6,7 +6,7 @@
 // runs anywhere (local dev box, CI) with whatever tools are present.
 
 import { assertEquals } from "@std/assert";
-import { fileSink, fromBytes, init, type Ouch } from "./mod.ts";
+import { fileSinkSync, fromBytes, init, type Ouch } from "./mod.ts";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -695,7 +695,7 @@ Deno.test({
     ouch.clear();
     const tmp = await Deno.makeTempFile({ suffix: ".zip" });
     try {
-      const sink = fileSink(tmp);
+      const sink = fileSinkSync(tmp);
       try {
         const chunks: Uint8Array[] = [];
         await ouch.compressTo(

@@ -45,7 +45,8 @@ export type OuchFormat =
  * directory, tar headers, 7z header) lives at known offsets, and a single
  * entry can be decompressed by seeking to its data — so the whole archive
  * never needs to enter wasm memory. `readAt` must be synchronous; see
- * [`fromBytes`] and [`fromFile`] for ready-made implementations.
+ * [`fromBytes`], [`fromFileSync`] (random-access file handles) and
+ * [`fromFile`] (async whole-file load) for ready-made implementations.
  */
 export interface SeekableSource {
   /** Total byte length of the source. */
@@ -71,7 +72,7 @@ export function fromBytes(bytes: Uint8Array): SeekableSource {
  * Node, `node:fs` is picked up via `process.getBuiltinModule` (or pass `fs`
  * explicitly on older versions / bundlers). Browsers have no sync file API.
  */
-export function fromFile(
+export function fromFileSync(
   path: string | URL,
   fs?: SyncFs,
 ): SeekableSource & { close(): void } {
@@ -90,7 +91,7 @@ export function fromFile(
 /**
  * A synchronous random-access byte sink. Zip/7z encoders require a `Seek`
  * output, so streaming compression for those formats writes into a host-side
- * sink (a Deno/Node file) instead of wasm memory; see [`fileSink`].
+ * sink (a Deno/Node file) instead of wasm memory; see [`fileSinkSync`].
  */
 export interface SeekableSink {
   /** Total bytes written so far. */
@@ -108,7 +109,7 @@ export interface SeekableSink {
  * is detected automatically; in Node, `node:fs` is picked up via
  * `process.getBuiltinModule` (or pass `fs` explicitly on older versions).
  */
-export function fileSink(
+export function fileSinkSync(
   path: string | URL,
   fs?: SyncFs,
 ): SeekableSink & { close(): void } {
@@ -130,8 +131,8 @@ export function fileSink(
 }
 
 /**
- * The subset of the synchronous `node:fs` API used by [`fromFile`] /
- * [`fileSink`]. Pass `node:fs` itself in Node, or a compatible shim.
+ * The subset of the synchronous `node:fs` API used by [`fromFileSync`] /
+ * [`fileSinkSync`]. Pass `node:fs` itself in Node, or a compatible shim.
  */
 export interface SyncFs {
   openSync(path: string | URL, flags: string): number;
@@ -175,7 +176,7 @@ function openFile(
     return openNodeFile(nfs, path, mode);
   }
   throw new Error(
-    "fromFile/fileSink need Deno or Node; pass a node:fs-like `fs` in other runtimes",
+    "fromFileSync/fileSinkSync need Deno or Node; pass a node:fs-like `fs` in other runtimes",
   );
 }
 
@@ -269,8 +270,8 @@ function openNodeFile(
 // files into memory for browsers (no synchronous file API).
 
 /**
- * The promise-based `fs` API subset used by [`readFileAsync`] /
- * [`writeFileAsync`] / [`fromFileAsync`]. Pass `node:fs/promises` (or a
+ * The promise-based `fs` API subset used by [`readFile`] /
+ * [`writeFile`] / [`fromFile`]. Pass `node:fs/promises` (or a
  * compatible shim); Deno is detected automatically.
  */
 export interface AsyncFs {
@@ -279,7 +280,7 @@ export interface AsyncFs {
 }
 
 /** Asynchronously read a whole file (Deno / Node / browser `fetch` for URLs). */
-export async function readFileAsync(
+export async function readFile(
   path: string | URL,
   fs?: AsyncFs,
 ): Promise<Uint8Array> {
@@ -287,7 +288,7 @@ export async function readFileAsync(
 }
 
 /** Asynchronously write a whole file (Deno / Node; browsers have no file API). */
-export async function writeFileAsync(
+export async function writeFile(
   path: string | URL,
   data: Uint8Array,
   fs?: AsyncFs,
@@ -297,15 +298,15 @@ export async function writeFileAsync(
 
 /**
  * Asynchronously load a file into memory and return a buffered seekable
- * source. Unlike [`fromFile`] (random-access sync handles), this reads the
+ * source. Unlike [`fromFileSync`] (random-access sync handles), this reads the
  * whole file through async I/O — best for moderate files, and the way to use
  * disk files from browsers (via `fetch`, or [`fromBlob`]).
  */
-export async function fromFileAsync(
+export async function fromFile(
   path: string | URL,
   fs?: AsyncFs,
 ): Promise<SeekableSource> {
-  return fromBytes(await readFileAsync(path, fs));
+  return fromBytes(await readFile(path, fs));
 }
 
 /** A seekable source over a Blob (e.g. a browser `File`), loaded asynchronously. */
@@ -368,7 +369,7 @@ export interface CompressOptions {
 export interface CompressFile {
   /** Path inside the archive. */
   path: string;
-  /** File content (a seekable source, e.g. [`fromBytes`] or [`fromFile`]). */
+  /** File content (a seekable source, e.g. [`fromBytes`] or [`fromFileSync`]). */
   source: SeekableSource;
   /** Unix permission bits (default `0o644`). */
   mode?: number;
@@ -662,7 +663,7 @@ export class Ouch {
    * from each file's source in bounded chunks. `tar` (including chains like
    * `tar.gz` / `tar.xz` / `tar.br`) and the single-stream formats push output
    * chunks directly to `writable`; `zip`/`7z` write into `options.sink` (a
-   * host-side seekable file, see [`fileSink`]) because their encoders need a
+   * host-side seekable file, see [`fileSinkSync`]) because their encoders need a
    * seekable output, then stream the file back in chunks — wasm memory stays
    * bounded either way. `bz2` needs the buffered VFS flow ([`Ouch#compress`]).
    */
@@ -698,7 +699,7 @@ export class Ouch {
     if (fmt === "zip" || fmt === "7z") {
       if (!options.sink) {
         throw new Error(
-          `${fmt} streaming compression needs a seekable sink (Deno/Node file); pass options.sink = fileSink(path)`,
+          `${fmt} streaming compression needs a seekable sink (Deno/Node file); pass options.sink = fileSinkSync(path)`,
         );
       }
       // Encode into the file, then stream it back in bounded chunks (this

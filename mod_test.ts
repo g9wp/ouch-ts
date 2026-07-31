@@ -1,15 +1,15 @@
 import { assert, assertEquals, assertRejects } from "@std/assert";
 import {
-  fileSink,
+  fileSinkSync,
   fromBlob,
   fromBytes,
   fromFile,
-  fromFileAsync,
+  fromFileSync,
   init,
-  readFileAsync,
+  readFile,
   type SeekableSource,
   walk,
-  writeFileAsync,
+  writeFile,
 } from "./mod.ts";
 
 function bytes(text: string): Uint8Array {
@@ -438,7 +438,7 @@ Deno.test("listFrom over a 7z source", async () => {
   );
 });
 
-Deno.test("fromFile reads a zip on disk via random access", async () => {
+Deno.test("fromFileSync reads a zip on disk via random access", async () => {
   const ouch = await init();
   ouch.clear();
 
@@ -449,7 +449,7 @@ Deno.test("fromFile reads a zip on disk via random access", async () => {
   const tmp = await Deno.makeTempFile({ suffix: ".zip" });
   try {
     await Deno.writeFile(tmp, archiveBytes);
-    const src = fromFile(tmp);
+    const src = fromFileSync(tmp);
     try {
       const entries = ouch.listFrom(src, { name: "disk.zip" });
       assertEquals(entries.map((e) => e.path), ["doc.txt"]);
@@ -637,7 +637,7 @@ Deno.test("compressTo reads input from a disk file", async () => {
   const tmp = await Deno.makeTempFile();
   try {
     await Deno.writeFile(tmp, payload);
-    const src = fromFile(tmp);
+    const src = fromFileSync(tmp);
     try {
       const chunks: Uint8Array[] = [];
       await ouch.compressTo(
@@ -657,7 +657,7 @@ Deno.test("compressTo reads input from a disk file", async () => {
   }
 });
 
-Deno.test("fromFile / fileSink work through a node:fs backend", async () => {
+Deno.test("fromFileSync / fileSinkSync work through a node:fs backend", async () => {
   // Exercises the Node position-based I/O path via Deno's node:fs shim.
   const fs = await import("node:fs");
   const ouch = await init();
@@ -667,7 +667,7 @@ Deno.test("fromFile / fileSink work through a node:fs backend", async () => {
   const tmp = await Deno.makeTempFile();
   try {
     await Deno.writeFile(tmp, payload);
-    const src = fromFile(tmp, fs);
+    const src = fromFileSync(tmp, fs);
     try {
       assertEquals(src.size, payload.length);
       assertEquals(text(src.readAt(5, 7)), "backend");
@@ -675,10 +675,10 @@ Deno.test("fromFile / fileSink work through a node:fs backend", async () => {
       src.close();
     }
 
-    // fileSink via node:fs: zip streams through the sink.
+    // fileSinkSync via node:fs: zip streams through the sink.
     const sinkPath = `${tmp}.zip`;
     try {
-      const sink = fileSink(sinkPath, fs);
+      const sink = fileSinkSync(sinkPath, fs);
       try {
         const chunks: Uint8Array[] = [];
         await ouch.compressTo(
@@ -728,7 +728,7 @@ Deno.test("compressTo writes zip through a file sink", async () => {
   const b = noise(256 * 1024);
   const tmp = await Deno.makeTempFile({ suffix: ".zip" });
   try {
-    const sink = fileSink(tmp);
+    const sink = fileSinkSync(tmp);
     try {
       const chunks: Uint8Array[] = [];
       const result = await ouch.compressTo(
@@ -765,7 +765,7 @@ Deno.test("compressTo writes 7z through a file sink", async () => {
   const payload = bytes("seven via file sink");
   const tmp = await Deno.makeTempFile({ suffix: ".7z" });
   try {
-    const sink = fileSink(tmp);
+    const sink = fileSinkSync(tmp);
     try {
       const chunks: Uint8Array[] = [];
       const result = await ouch.compressTo(
@@ -794,7 +794,7 @@ Deno.test("compressTo zip via file sink with encryption", async () => {
   const payload = bytes("secret zip via sink");
   const tmp = await Deno.makeTempFile({ suffix: ".zip" });
   try {
-    const sink = fileSink(tmp);
+    const sink = fileSinkSync(tmp);
     try {
       const chunks: Uint8Array[] = [];
       await ouch.compressTo(
@@ -821,7 +821,7 @@ Deno.test("compressTo zip via file sink with encryption", async () => {
   }
 });
 
-Deno.test("readFileAsync / writeFileAsync / fromFileAsync roundtrip", async () => {
+Deno.test("readFile / writeFile / fromFile roundtrip", async () => {
   const ouch = await init();
   ouch.clear();
 
@@ -831,10 +831,10 @@ Deno.test("readFileAsync / writeFileAsync / fromFileAsync roundtrip", async () =
 
   const tmp = await Deno.makeTempFile({ suffix: ".zip" });
   try {
-    await writeFileAsync(tmp, archive);
-    assertEquals(await readFileAsync(tmp), archive);
+    await writeFile(tmp, archive);
+    assertEquals(await readFile(tmp), archive);
 
-    const src = await fromFileAsync(tmp);
+    const src = await fromFile(tmp);
     const entries = ouch.listFrom(src, { name: "a.zip" });
     assertEquals(entries.map((e) => e.path), ["a.txt"]);
     assertEquals(text(entries[0].bytes), "async file io");
@@ -843,12 +843,12 @@ Deno.test("readFileAsync / writeFileAsync / fromFileAsync roundtrip", async () =
   }
 });
 
-Deno.test("fromFileAsync works through a node:fs/promises backend", async () => {
+Deno.test("fromFile works through a node:fs/promises backend", async () => {
   const promises = await import("node:fs/promises");
   const tmp = await Deno.makeTempFile();
   try {
     await Deno.writeFile(tmp, bytes("node promises"));
-    const src = await fromFileAsync(tmp, promises);
+    const src = await fromFile(tmp, promises);
     assertEquals(text(src.readAt(0, 13)), "node promises");
   } finally {
     await Deno.remove(tmp);
