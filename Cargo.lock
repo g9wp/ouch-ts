@@ -1165,6 +1165,7 @@ dependencies = [
  "insta",
  "is_executable",
  "itertools 0.15.0",
+ "js-sys",
  "landlock",
  "libc",
  "lz4_flex",
@@ -1186,6 +1187,7 @@ dependencies = [
  "test-strategy",
  "time",
  "unrar-ng",
+ "wasm-bindgen",
  "zip",
  "zstd",
 ]

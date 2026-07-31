@@ -13,41 +13,60 @@ license = "MIT"
 keywords = ["decompression", "compression", "cli"]
 categories = ["command-line-utilities", "compression", "encoding"]
 description = "A command-line utility for easily compressing and decompressing files and directories."
+autobins = false
+
+# The bundled wasm-opt in old wasm-pack versions chokes on wasm-bindgen 0.2.9x+
+# output (exnref etc.); rustc --release already optimizes well enough.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+[package.metadata.wasm-pack.profile.dev]
+wasm-opt = false
+
+[lib]
+name = "ouch"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "ouch"
+path = "src/main.rs"
+required-features = ["cli"]
 
 [dependencies]
 brotli = "8.0.2"
 bstr = { version = "1.12.1", default-features = false, features = ["std"] }
-bzip2 = "0.6.1"
+bzip2 = { version = "0.6.1", optional = true }
 bzip3 = { version = "0.12.0", features = ["bundled"], optional = true }
-clap = { version = "4.6.1", features = ["derive", "env"] }
+clap = { version = "4.6.1", features = ["derive", "env"], optional = true }
 file_type_enum = "3.0.1"
 filetime_creation = "0.2"
 flate2 = { version = "1.1.9", default-features = false }
 fs-err = "3.3.0"
 gzp = { version = "2.0.2", default-features = false, features = [
     "snappy_default",
-] }
+], optional = true }
 ignore = "0.4.25"
 indexmap = "2"
 is_executable = "1.0.5"
-libc = "0.2.186"
+js-sys = { version = "0.3.77", optional = true }
+libc = { version = "0.2.186", optional = true }
 lz4_flex = "0.14.0"
 lzma-rust2 = "0.17.0"
 num_cpus = "1.17.0"
-rayon = "1.12.0"
+rayon = { version = "1.12.0", optional = true }
 same-file = "1.0.6"
 sevenz-rust2 = { version = "0.21.0", features = ["compress", "aes256"] }
 snap = "1.1.1"
 strum = { version = "0.28.0", features = ["derive"] }
 tar = "0.4.46"
-tempfile = "3.27.0"
+tempfile = { version = "3.27.0", optional = true }
 time = { version = "0.3.47", default-features = false }
 unrar = { package = "unrar-ng", version = "0.7.6", optional = true }
+wasm-bindgen = { version = "0.2.100", optional = true }
 zip = { version = "8.6.0", default-features = false, features = [
     "time",
     "aes-crypto",
 ] }
-zstd = { version = "0.13.3", default-features = false, features = ["zstdmt"] }
+zstd = { version = "0.13.3", default-features = false, features = ["zstdmt"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4.5"
@@ -78,7 +97,27 @@ clap_complete_nushell = "4.6.0"
 clap_mangen = "0.3.0"
 
 [features]
-default = ["unrar", "use_zlib", "use_zstd_thin", "bzip3"]
+default = ["cli", "unrar", "use_zlib", "use_zstd_thin", "bzip3"]
+
+# Everything the native CLI needs. Kept out of the `wasm` build.
+cli = [
+    "dep:clap",
+    "dep:rayon",
+    "dep:gzp",
+    "dep:bzip2",
+    "dep:zstd",
+    "dep:tempfile",
+    "dep:libc",
+]
+
+# The browser/Node library: pure-Rust codecs + wasm-bindgen bindings.
+wasm = [
+    "dep:wasm-bindgen",
+    "dep:js-sys",
+    "flate2/zlib-rs",
+    "zip/deflate-flate2-zlib-rs",
+]
+
 use_zlib = ["flate2/zlib-rs", "gzp/deflate_rust", "zip/deflate-flate2-zlib-rs"]
 use_zstd_thin = ["zstd/thin"]
 

@@ -1,5 +1,0 @@
-# pinned toolchain for reproducible builds.
-# bump deliberately, not on every "stable" release.
-[toolchain]
-channel = "1.93.0"
-profile = "minimal"
