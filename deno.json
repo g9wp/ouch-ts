@@ -9,7 +9,7 @@
   "tasks": {
     "build": "deno run -A build.ts",
     "test": "deno test -A",
-    "check": "deno check mod.ts mod_test.ts"
+    "check": "deno check mod.ts mod_test.ts cross_test.ts"
   },
   "publish": {
     "exclude": [
@@ -17,6 +17,7 @@
       ".github/",
       "build.ts",
       "mod_test.ts",
+      "cross_test.ts",
       "ouch/"
     ]
   }

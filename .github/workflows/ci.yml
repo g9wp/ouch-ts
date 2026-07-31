@@ -13,6 +13,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install cross-test tools
+        run: sudo apt-get update && sudo apt-get install -y zip p7zip-full xz-utils brotli lz4
+
       - name: Setup Deno
         uses: denoland/setup-deno@v2
         with:
@@ -35,7 +38,7 @@ jobs:
         run: deno task build
 
       - name: Format check
-        run: deno fmt --check mod.ts mod_test.ts build.ts deno.json
+        run: deno fmt --check mod.ts mod_test.ts cross_test.ts build.ts deno.json
 
       - name: Type check
         run: deno task check
