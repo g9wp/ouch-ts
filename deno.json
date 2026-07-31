@@ -13,6 +13,8 @@
   },
   "publish": {
     "exclude": [
+      "!pkg",
+      ".github/",
       "build.ts",
       "mod_test.ts",
       "ouch/"

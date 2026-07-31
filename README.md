@@ -81,17 +81,31 @@ const archive = ouch.readFile("docs.tar.gz");
 
 ## Publishing (JSR)
 
-`deno.json` already carries `name` / `version` / `exports` / `publish.exclude`
-(the whole `ouch/` rust repo is excluded; `pkg/` and `mod.ts` are included).
+Pushing a `vX.Y.Z` tag runs `.github/workflows/publish.yml`: it builds the
+wasm package and publishes `@g9wp/ouch` to JSR using tokenless OIDC
+authentication (the tag version must match `version` in `deno.json`).
+
+Prerequisites:
+
+1. Create the package scope/name on [jsr.io](https://jsr.io) first.
+2. Link the package to this GitHub repository in the package settings
+   (JSR > your package > Settings > GitHub repository).
+
+Release flow:
 
 ```sh
-git init        # the workspace root must be a git repo for `deno publish`
-git add -A
-git commit -m "init"
-deno task build # ensure ./pkg is up to date
-# bump the version in deno.json, then:
-deno publish
+# 1. bump the version in deno.json
+# 2. commit, then tag and push
+git tag v0.1.0
+git push origin v0.1.0
 ```
+
+`pkg/` is gitignored but included in the published package via
+`publish.exclude: ["!pkg", ...]`; the workflow regenerates it with
+`deno task build` before publishing.
+
+Alternatively, publish from a local machine with `deno publish` (browser
+authentication).
 
 ## Notes
 

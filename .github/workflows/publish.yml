@@ -1,0 +1,52 @@
+name: Publish
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  # OIDC identity token: allows tokenless publishing to JSR (jsr.io).
+  # Requires the package to be linked to this repository in its JSR settings.
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Setup Rust (wasm32 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ouch
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Build wasm package
+        run: deno task build
+
+      - name: Check version matches the tag
+        run: |
+          version="$(deno eval "console.log(JSON.parse(Deno.readTextFileSync('deno.json')).version)")"
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$version" != "$tag" ]; then
+            echo "deno.json version ($version) does not match tag ($GITHUB_REF_NAME)" >&2
+            exit 1
+          fi
+          echo "Publishing @g9wp/ouch@$version"
+
+      - name: Publish to JSR
+        run: deno publish
