@@ -43,7 +43,13 @@ fn unsafe_path_error(path: &Path) -> crate::Error {
 /// List the contents of an in-memory zip archive (metadata only, so it also
 /// works on password-protected archives without a password).
 pub fn list_zip(input: &[u8], password: Option<&[u8]>) -> Result<Vec<Entry>> {
-    let mut archive = zip::ZipArchive::new(Cursor::new(input))?;
+    list_zip_reader(Cursor::new(input), password)
+}
+
+/// Like [`list_zip`], but reads from any seekable source (e.g. a JS-backed
+/// random-access reader) so the whole archive never needs to be in memory.
+pub fn list_zip_reader<R: Read + Seek>(input: R, password: Option<&[u8]>) -> Result<Vec<Entry>> {
+    let mut archive = zip::ZipArchive::new(input)?;
     let mut entries = Vec::with_capacity(archive.len());
     for idx in 0..archive.len() {
         let mut file = match password {
@@ -131,7 +137,17 @@ pub fn build_zip(entries: &[Entry], level: Option<i16>, password: Option<&str>) 
 
 /// Read a single entry's contents from an in-memory zip archive.
 pub fn read_zip_entry(input: &[u8], password: Option<&[u8]>, entry_name: &str) -> Result<Vec<u8>> {
-    let mut archive = zip::ZipArchive::new(Cursor::new(input))?;
+    read_zip_entry_reader(Cursor::new(input), password, entry_name)
+}
+
+/// Like [`read_zip_entry`], but reads from any seekable source so only the
+/// target entry's data is pulled from the host.
+pub fn read_zip_entry_reader<R: Read + Seek>(
+    input: R,
+    password: Option<&[u8]>,
+    entry_name: &str,
+) -> Result<Vec<u8>> {
+    let mut archive = zip::ZipArchive::new(input)?;
     for idx in 0..archive.len() {
         let mut file = match password {
             Some(password) => archive.by_index_decrypt(idx, password)?,
@@ -158,13 +174,28 @@ pub fn read_zip_entry(input: &[u8], password: Option<&[u8]>, entry_name: &str) -
 
 /// List the contents of an in-memory tar archive (metadata only).
 pub fn list_tar(input: &[u8]) -> Result<Vec<Entry>> {
-    let mut archive = tar::Archive::new(Cursor::new(input));
-    let mut entries = Vec::new();
-    for file in archive.entries()? {
+    list_tar_seekable(Cursor::new(input))
+}
+
+/// Like [`list_tar`], but reads from any seekable source; file data is
+/// skipped by seek, so listing a large tar only touches header blocks.
+pub fn list_tar_seekable<R: Read + Seek>(input: R) -> Result<Vec<Entry>> {
+    collect_tar_entries(tar::Archive::new(input).entries_with_seek()?, false)
+}
+
+/// Like [`list_tar`], for non-seekable (e.g. decoder-chained) readers, where
+/// file data is read through instead of skipped.
+pub fn list_tar_chained<R: Read>(input: R) -> Result<Vec<Entry>> {
+    collect_tar_entries(tar::Archive::new(input).entries()?, false)
+}
+
+fn collect_tar_entries<R: Read>(entries: tar::Entries<'_, R>, read_data: bool) -> Result<Vec<Entry>> {
+    let mut out = Vec::new();
+    for file in entries {
         let mut file = file?;
-        entries.push(tar_entry_to_entry(&mut file, false)?);
+        out.push(tar_entry_to_entry(&mut file, read_data)?);
     }
-    Ok(entries)
+    Ok(out)
 }
 
 /// Unpack an in-memory tar archive into a list of entries (reads contents).
@@ -180,8 +211,22 @@ pub fn unpack_tar(input: &[u8]) -> Result<Vec<Entry>> {
 
 /// Read a single entry's contents from an in-memory tar archive.
 pub fn read_tar_entry(input: &[u8], entry_name: &str) -> Result<Vec<u8>> {
-    let mut archive = tar::Archive::new(Cursor::new(input));
-    for file in archive.entries()? {
+    read_tar_entry_seekable(Cursor::new(input), entry_name)
+}
+
+/// Like [`read_tar_entry`], from a seekable source: non-matching entries are
+/// skipped by seek.
+pub fn read_tar_entry_seekable<R: Read + Seek>(input: R, entry_name: &str) -> Result<Vec<u8>> {
+    read_tar_matching(tar::Archive::new(input).entries_with_seek()?, entry_name)
+}
+
+/// Like [`read_tar_entry`], for non-seekable (e.g. decoder-chained) readers.
+pub fn read_tar_entry_chained<R: Read>(input: R, entry_name: &str) -> Result<Vec<u8>> {
+    read_tar_matching(tar::Archive::new(input).entries()?, entry_name)
+}
+
+fn read_tar_matching<R: Read>(entries: tar::Entries<'_, R>, entry_name: &str) -> Result<Vec<u8>> {
+    for file in entries {
         let mut file = file?;
         let raw_path = file.path()?.into_owned();
         if normalize_name(&raw_path) == entry_name {
@@ -202,7 +247,7 @@ pub fn read_tar_entry(input: &[u8], entry_name: &str) -> Result<Vec<u8>> {
     Err(entry_not_found(entry_name))
 }
 
-fn tar_entry_to_entry(entry: &mut tar::Entry<'_, Cursor<&[u8]>>, read_data: bool) -> Result<Entry> {
+fn tar_entry_to_entry<R: Read>(entry: &mut tar::Entry<'_, R>, read_data: bool) -> Result<Entry> {
     let raw_path = entry.path()?.into_owned();
     let path = validate_entry_path(&raw_path).map_err(|_| unsafe_path_error(&raw_path))?;
 
@@ -305,7 +350,13 @@ fn sevenz_password(password: Option<&[u8]>) -> Result<sevenz_rust2::Password> {
 
 /// List the contents of an in-memory 7z archive.
 pub fn list_7z(input: &[u8], password: Option<&[u8]>) -> Result<Vec<Entry>> {
-    let mut reader = sevenz_rust2::ArchiveReader::new(Cursor::new(input), sevenz_password(password)?)?;
+    list_7z_reader(Cursor::new(input), password)
+}
+
+/// Like [`list_7z`], but reads from any seekable source so only the header
+/// blocks are pulled from the host.
+pub fn list_7z_reader<R: Read + Seek>(input: R, password: Option<&[u8]>) -> Result<Vec<Entry>> {
+    let mut reader = sevenz_rust2::ArchiveReader::new(input, sevenz_password(password)?)?;
     let mut entries = Vec::new();
     reader.for_each_entries(|entry, _reader| {
         entries.push(Entry {
@@ -325,7 +376,16 @@ pub fn list_7z(input: &[u8], password: Option<&[u8]>) -> Result<Vec<Entry>> {
 /// Uses `ArchiveReader::read_file`, which decodes only the blocks needed to
 /// reach the requested entry (solid archives decode everything before it).
 pub fn read_7z_entry(input: &[u8], password: Option<&[u8]>, entry_name: &str) -> Result<Vec<u8>> {
-    let mut reader = sevenz_rust2::ArchiveReader::new(Cursor::new(input), sevenz_password(password)?)?;
+    read_7z_entry_reader(Cursor::new(input), password, entry_name)
+}
+
+/// Like [`read_7z_entry`], but reads from any seekable source.
+pub fn read_7z_entry_reader<R: Read + Seek>(
+    input: R,
+    password: Option<&[u8]>,
+    entry_name: &str,
+) -> Result<Vec<u8>> {
+    let mut reader = sevenz_rust2::ArchiveReader::new(input, sevenz_password(password)?)?;
     reader.read_file(entry_name).map_err(|err| match err {
         sevenz_rust2::Error::FileNotFound => entry_not_found(entry_name),
         other => other.into(),
@@ -609,15 +669,32 @@ pub fn pump_zip_entry<R: Read + Seek>(
     Err(entry_not_found(entry_name))
 }
 
-/// Stream one entry's contents out of an in-memory tar archive in chunks.
-/// `input` may already be a chained decoder (e.g. gz under tar).
-pub fn pump_tar_entry<R: Read>(
+/// Stream one entry's contents out of an in-memory tar archive in chunks,
+/// from a seekable source (non-matching entries are seek-skipped).
+pub fn pump_tar_seekable<R: Read + Seek>(
     input: R,
     entry_name: &str,
     emit: &mut dyn FnMut(&[u8]) -> Result<()>,
 ) -> Result<()> {
-    let mut archive = tar::Archive::new(input);
-    for file in archive.entries()? {
+    pump_tar_matching(tar::Archive::new(input).entries_with_seek()?, entry_name, emit)
+}
+
+/// Stream one entry's contents out of an in-memory tar archive in chunks,
+/// from a non-seekable (e.g. decoder-chained) reader.
+pub fn pump_tar_chained<R: Read>(
+    input: R,
+    entry_name: &str,
+    emit: &mut dyn FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    pump_tar_matching(tar::Archive::new(input).entries()?, entry_name, emit)
+}
+
+fn pump_tar_matching<R: Read>(
+    entries: tar::Entries<'_, R>,
+    entry_name: &str,
+    emit: &mut dyn FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    for file in entries {
         let mut file = file?;
         let raw_path = file.path()?.into_owned();
         if normalize_name(&raw_path) != entry_name {
@@ -645,7 +722,18 @@ pub fn pump_7z_entry(
     entry_name: &str,
     emit: &mut dyn FnMut(&[u8]) -> Result<()>,
 ) -> Result<()> {
-    let data = read_7z_entry(input, password, entry_name)?;
+    pump_7z_entry_reader(Cursor::new(input), password, entry_name, emit)
+}
+
+/// Like [`pump_7z_entry`], but reads from any seekable source so only the
+/// target entry is pulled from the host.
+pub fn pump_7z_entry_reader<R: Read + Seek>(
+    input: R,
+    password: Option<&[u8]>,
+    entry_name: &str,
+    emit: &mut dyn FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    let data = read_7z_entry_reader(input, password, entry_name)?;
     for chunk in data.chunks(crate::wasm::STREAM_CHUNK_SIZE) {
         emit(chunk)?;
     }

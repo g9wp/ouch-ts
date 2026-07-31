@@ -65,6 +65,9 @@ const archive = ouch.readFile("docs.tar.gz");
 | `ouch.listArchive(options)`  | List archive entries; `bytes`/`readable` decode lazily.  |
 | `ouch.readEntry(archive, e)` | Read one entry's bytes from an archive.                  |
 | `ouch.streamEntry(archive, e)` | **Stream** one entry in bounded chunks (large files).  |
+| `ouch.listFrom(src, opts)`      | List an archive held by a JS-side [`SeekableSource`]. |
+| `ouch.readEntryFrom(src, e)`    | Read one entry via random access (seek, no full load). |
+| `ouch.streamEntryFrom(src, e)`  | Stream one entry from a seekable source in chunks.     |
 | `ouch.walk(options)`         | Async-generator over entries, decoded on demand.         |
 | `ouch.clear()`               | Reset the virtual filesystem.                            |
 
@@ -128,6 +131,15 @@ authentication).
   libraries' sequential readers, so they are not random-access.
   `readEntry()` / `entry.bytes` / `decompress()` still materialize the whole
   entry in memory — prefer streaming for anything large.
+- **Random access via `SeekableSource`**: `listFrom` / `readEntryFrom` /
+  `streamEntryFrom` keep the archive on the JS side (`fromBytes`, or
+  `fromFile` in Deno) and wasm pulls only the ranges it needs through a
+  synchronous `readAt(offset, length)` callback. Zip metadata (central
+  directory), tar headers and 7z headers are read by seeking, and a single
+  entry is decompressed by seeking to its data — the whole archive never
+  enters wasm memory. `tar.*` chains decode sequentially; wrapped
+  zip/7z/rar and `rar` (no random-access reader) fall back to whole-source
+  reads. Byte sizes are JS `number`s (exact up to 2^53).
 - `password` enables AES-256 encryption when compressing to zip/7z;
   encrypted archives need it to list, read or extract. `level` (0-9) applies
   to zip (deflate), 7z (LZMA2) and the streaming formats.

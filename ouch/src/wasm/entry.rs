@@ -13,7 +13,7 @@ use crate::{
     Result,
     error::FinalError,
     extension::{self, CompressionFormat, split_first_compression_format},
-    wasm::{archives, codecs, vfs},
+    wasm::{archives, codecs, seekable, vfs},
 };
 
 fn js_error(err: impl std::fmt::Display) -> JsError {
@@ -169,6 +169,49 @@ impl OuchWasm {
     /// `Uint8Array`; the call returns after the last chunk.
     pub fn stream_entry(args: StreamEntryArgs, on_chunk: js_sys::Function) -> Result<(), JsError> {
         run_stream_entry(&args, on_chunk).map_err(js_error)
+    }
+
+    /// List the contents of an archive held by a JS-side random-access source
+    /// (`read_at(offset, length) -> Uint8Array`, `size` bytes total). Only the
+    /// metadata blocks are pulled from the host, so the whole archive never
+    /// enters wasm memory.
+    pub fn seekable_list(
+        args: SeekableArgs,
+        read_at: js_sys::Function,
+        size: f64,
+    ) -> Result<Vec<JsValue>, JsError> {
+        run_seekable_list(&args, read_at, size as u64).map_err(js_error).map(|entries| {
+            entries
+                .into_iter()
+                .map(|(archive, entry)| {
+                    let obj = entry_to_js(entry);
+                    js_sys::Reflect::set(&obj, &JsValue::from_str("archive"), &JsValue::from_str(&archive))
+                        .expect("setting js object property");
+                    obj
+                })
+                .collect()
+        })
+    }
+
+    /// Read a single entry from an archive held by a JS-side random-access
+    /// source; only that entry's data is pulled from the host.
+    pub fn seekable_read_entry(
+        args: SeekableArgs,
+        read_at: js_sys::Function,
+        size: f64,
+    ) -> Result<Vec<u8>, JsError> {
+        run_seekable_read_entry(&args, read_at, size as u64).map_err(js_error)
+    }
+
+    /// Stream one entry from an archive held by a JS-side random-access
+    /// source in bounded chunks.
+    pub fn seekable_stream_entry(
+        args: SeekableArgs,
+        read_at: js_sys::Function,
+        size: f64,
+        on_chunk: js_sys::Function,
+    ) -> Result<(), JsError> {
+        run_seekable_stream_entry(&args, read_at, size as u64, on_chunk).map_err(js_error)
     }
 }
 
@@ -361,16 +404,59 @@ impl StreamEntryArgs {
     }
 }
 
+/// Arguments for the seekable (JS-backed random-access) operations. `name`
+/// (e.g. "archive.zip") is used to infer the format; `entry` is ignored by
+/// [`OuchWasm::seekable_list`].
+#[wasm_bindgen]
+#[derive(Default)]
+pub struct SeekableArgs {
+    #[wasm_bindgen(skip)]
+    pub name: String,
+    #[wasm_bindgen(skip)]
+    pub entry: String,
+    #[wasm_bindgen(skip)]
+    pub password: Option<String>,
+    #[wasm_bindgen(skip)]
+    pub format: Option<String>,
+}
+
+#[wasm_bindgen]
+impl SeekableArgs {
+    #[wasm_bindgen(constructor)]
+    pub fn new(name: String, entry: String) -> Self {
+        Self {
+            name,
+            entry,
+            ..Default::default()
+        }
+    }
+
+    pub fn set_password(&mut self, password: String) {
+        self.password = Some(password);
+    }
+
+    pub fn set_format(&mut self, format: String) {
+        self.format = Some(format);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Orchestration
 // ---------------------------------------------------------------------------
 
 fn format_from_path_or_flag(path: &str, flag: Option<&str>) -> Result<Vec<extension::Extension>> {
-    if let Some(flag) = flag {
+    let formats = if let Some(flag) = flag {
         extension::parse_format_flag(flag)
     } else {
         extension::extensions_from_path(Path::new(path))
+    }?;
+    if formats.is_empty() {
+        return Err(crate::Error::Custom {
+            reason: FinalError::with_title(format!("cannot infer a format from '{path}'"))
+                .hint("pass `format`, e.g. \"zip\" or \"tar.gz\""),
+        });
     }
+    Ok(formats)
 }
 
 fn read_input(path: &str) -> Result<Vec<u8>> {
@@ -746,7 +832,7 @@ fn run_stream_entry(args: &StreamEntryArgs, on_chunk: js_sys::Function) -> Resul
     match first {
         CompressionFormat::Tar => {
             let reader = chain_input_reader(&input, &rest)?;
-            archives::pump_tar_entry(reader, &entry_name, &mut emit)
+            archives::pump_tar_chained(reader, &entry_name, &mut emit)
         }
         CompressionFormat::Zip => {
             // Zip needs a seekable source; decode any wrapping layers first.
@@ -767,5 +853,161 @@ fn run_stream_entry(args: &StreamEntryArgs, on_chunk: js_sys::Function) -> Resul
             reader = codecs::wrap_decoder(non_archive, reader)?;
             archives::pump_read(&mut reader, &mut emit)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Seekable (JS-backed random-access) operations
+// ---------------------------------------------------------------------------
+
+fn seekable_split(args: &SeekableArgs) -> Result<(CompressionFormat, Vec<CompressionFormat>)> {
+    let formats = format_from_path_or_flag(&args.name, args.format.as_deref())?;
+    Ok(split_first_compression_format(&formats))
+}
+
+/// Pull the whole source into memory (rar has no random-access reader).
+fn seekable_read_all(reader: &mut dyn std::io::Read) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    crate::utils::copy_limited_decompression(reader, &mut out)?;
+    Ok(out)
+}
+
+fn seekable_wrapped_error() -> crate::Error {
+    crate::Error::Custom {
+        reason: FinalError::with_title("wrapped zip/7z/rar archives are not supported with a seekable source")
+            .hint("use a tar.* chain, or load the archive into the virtual filesystem instead"),
+    }
+}
+
+/// Wrap a seekable reader in the `rest` codec decoders (for tar.* chains).
+fn seekable_tar_reader(
+    read_at: js_sys::Function,
+    size: u64,
+    rest: &[CompressionFormat],
+) -> Result<Box<dyn std::io::Read>> {
+    let mut reader: Box<dyn std::io::Read> = Box::new(seekable::JsSeekReader::new(read_at, size));
+    for format in rest.iter().rev() {
+        reader = codecs::wrap_decoder(*format, reader)?;
+    }
+    Ok(reader)
+}
+
+fn run_seekable_list(
+    args: &SeekableArgs,
+    read_at: js_sys::Function,
+    size: u64,
+) -> Result<Vec<(String, archives::Entry)>> {
+    let (first, rest) = seekable_split(args)?;
+    let password = args.password.as_deref().map(|p| p.as_bytes());
+    let name = args.name.clone();
+    let mut all = Vec::new();
+
+    match first {
+        CompressionFormat::Tar => {
+            if rest.is_empty() {
+                // Uncompressed tar: headers are read, file data is seek-skipped.
+                for entry in archives::list_tar_seekable(seekable::JsSeekReader::new(read_at, size))? {
+                    all.push((name.clone(), entry));
+                }
+            } else {
+                // tar.gz / tar.xz / ...: the whole chain decodes sequentially.
+                let reader = seekable_tar_reader(read_at, size, &rest)?;
+                for entry in archives::list_tar_chained(reader)? {
+                    all.push((name.clone(), entry));
+                }
+            }
+        }
+        CompressionFormat::Zip if rest.is_empty() => {
+            for entry in archives::list_zip_reader(seekable::JsSeekReader::new(read_at, size), password)? {
+                all.push((name.clone(), entry));
+            }
+        }
+        CompressionFormat::SevenZip if rest.is_empty() => {
+            for entry in archives::list_7z_reader(seekable::JsSeekReader::new(read_at, size), password)? {
+                all.push((name.clone(), entry));
+            }
+        }
+        CompressionFormat::Rar if rest.is_empty() => {
+            let mut reader = seekable::JsSeekReader::new(read_at, size);
+            let input = seekable_read_all(&mut reader)?;
+            for entry in archives::list_rar(&input, password)? {
+                all.push((name.clone(), entry));
+            }
+        }
+        _ => return Err(seekable_wrapped_error()),
+    }
+    Ok(all)
+}
+
+fn run_seekable_read_entry(
+    args: &SeekableArgs,
+    read_at: js_sys::Function,
+    size: u64,
+) -> Result<Vec<u8>> {
+    let (first, rest) = seekable_split(args)?;
+    let password = args.password.as_deref().map(|p| p.as_bytes());
+    let entry_name = args.entry.replace('\\', "/");
+
+    match first {
+        CompressionFormat::Tar => {
+            if rest.is_empty() {
+                archives::read_tar_entry_seekable(seekable::JsSeekReader::new(read_at, size), &entry_name)
+            } else {
+                archives::read_tar_entry_chained(seekable_tar_reader(read_at, size, &rest)?, &entry_name)
+            }
+        }
+        CompressionFormat::Zip if rest.is_empty() => {
+            archives::read_zip_entry_reader(seekable::JsSeekReader::new(read_at, size), password, &entry_name)
+        }
+        CompressionFormat::SevenZip if rest.is_empty() => {
+            archives::read_7z_entry_reader(seekable::JsSeekReader::new(read_at, size), password, &entry_name)
+        }
+        CompressionFormat::Rar if rest.is_empty() => {
+            let mut reader = seekable::JsSeekReader::new(read_at, size);
+            let input = seekable_read_all(&mut reader)?;
+            archives::read_rar_entry(&input, password, &entry_name)
+        }
+        _ => Err(seekable_wrapped_error()),
+    }
+}
+
+fn run_seekable_stream_entry(
+    args: &SeekableArgs,
+    read_at: js_sys::Function,
+    size: u64,
+    on_chunk: js_sys::Function,
+) -> Result<()> {
+    let (first, rest) = seekable_split(args)?;
+    let password = args.password.as_deref().map(|p| p.as_bytes());
+    let entry_name = args.entry.replace('\\', "/");
+
+    let mut emit = move |chunk: &[u8]| -> Result<()> {
+        let js = js_sys::Uint8Array::from(chunk);
+        on_chunk.call1(&JsValue::NULL, &js).map_err(|e| crate::Error::Custom {
+            reason: FinalError::with_title("stream was cancelled").detail(format!("{e:?}")),
+        })?;
+        Ok(())
+    };
+
+    match first {
+        CompressionFormat::Tar => {
+            if rest.is_empty() {
+                archives::pump_tar_seekable(seekable::JsSeekReader::new(read_at, size), &entry_name, &mut emit)
+            } else {
+                archives::pump_tar_chained(seekable_tar_reader(read_at, size, &rest)?, &entry_name, &mut emit)
+            }
+        }
+        CompressionFormat::Zip if rest.is_empty() => {
+            archives::pump_zip_entry(seekable::JsSeekReader::new(read_at, size), password, &entry_name, &mut emit)
+        }
+        CompressionFormat::SevenZip if rest.is_empty() => {
+            archives::pump_7z_entry_reader(seekable::JsSeekReader::new(read_at, size), password, &entry_name, &mut emit)
+        }
+        CompressionFormat::Rar if rest.is_empty() => {
+            let mut reader = seekable::JsSeekReader::new(read_at, size);
+            let input = seekable_read_all(&mut reader)?;
+            archives::pump_rar_entry(&input, password, &entry_name, Box::new(emit))
+        }
+        _ => Err(seekable_wrapped_error()),
     }
 }

@@ -13,6 +13,7 @@ import initWasm, {
   ListArgs,
   OuchWasm,
   ReadEntryArgs,
+  SeekableArgs,
   StreamEntryArgs,
 } from "./pkg/ouch.js";
 
@@ -36,6 +37,68 @@ export type OuchFormat =
   | "bz2"
   | "zst"
   | "rar";
+
+/**
+ * A synchronous random-access byte source. Most archive metadata (zip central
+ * directory, tar headers, 7z header) lives at known offsets, and a single
+ * entry can be decompressed by seeking to its data — so the whole archive
+ * never needs to enter wasm memory. `readAt` must be synchronous; see
+ * [`fromBytes`] and [`fromFile`] for ready-made implementations.
+ */
+export interface SeekableSource {
+  /** Total byte length of the source. */
+  readonly size: number;
+  /** Read up to `length` bytes starting at `offset` (clamped to EOF). */
+  readAt(offset: number, length: number): Uint8Array;
+}
+
+/** A seekable source over an in-memory byte buffer. */
+export function fromBytes(bytes: Uint8Array): SeekableSource {
+  return {
+    size: bytes.length,
+    readAt(offset, length) {
+      return bytes.slice(offset, Math.min(offset + length, bytes.length));
+    },
+  };
+}
+
+/**
+ * A seekable source over a Deno file, opened read-only and kept open until
+ * `close()` is called. This gives true disk random access: listing a huge
+ * archive only reads its header blocks. Not available in browsers (no sync
+ * file API); pass `--allow-read` when running under Deno.
+ */
+export function fromFile(
+  path: string | URL,
+): SeekableSource & { close(): void } {
+  const deno = (globalThis as unknown as {
+    Deno?: {
+      openSync(p: string | URL, opts: { read: true }): {
+        statSync(): { size: number };
+        seekSync(offset: number, mode: number): number;
+        readSync(buf: Uint8Array): number | null;
+        close(): void;
+      };
+    };
+  }).Deno;
+  if (!deno) {
+    throw new Error("fromFile is only available in Deno");
+  }
+  const file = deno.openSync(path, { read: true });
+  return {
+    size: file.statSync().size,
+    readAt(offset, length) {
+      // Deno.SeekMode.Start === 0
+      file.seekSync(offset, 0);
+      const buf = new Uint8Array(length);
+      const n = file.readSync(buf);
+      return n === null ? new Uint8Array(0) : buf.slice(0, n);
+    },
+    close() {
+      file.close();
+    },
+  };
+}
 
 export interface CompressOptions {
   /** Paths (in the virtual filesystem) to compress. */
@@ -98,7 +161,15 @@ interface RawEntry {
 /** Where an entry's bytes can be read from. */
 type EntrySource =
   | { kind: "vfs"; path: string }
-  | { kind: "archive"; archive: string; password?: string; format?: string };
+  | { kind: "archive"; archive: string; password?: string; format?: string }
+  | {
+    kind: "seekable";
+    source: SeekableSource;
+    /** Name used to infer the format for lazy reads (e.g. "archive.zip"). */
+    name: string;
+    password?: string;
+    format?: string;
+  };
 
 // ---------------------------------------------------------------------------
 // DecompressEntry
@@ -142,6 +213,13 @@ export class DecompressEntry {
     if (this.#source.kind === "vfs") {
       return this.#ouch.readFile(this.#source.path);
     }
+    if (this.#source.kind === "seekable") {
+      return this.#ouch.readEntryFrom(this.#source.source, this.path, {
+        name: this.#source.name,
+        password: this.#source.password,
+        format: this.#source.format,
+      });
+    }
     return this.#ouch.readEntry(this.#source.archive, this.path, {
       password: this.#source.password,
       format: this.#source.format,
@@ -174,6 +252,13 @@ export class DecompressEntry {
           controller.enqueue(this.#ouch.readFile(source.path));
           controller.close();
         },
+      });
+    }
+    if (source.kind === "seekable") {
+      return this.#ouch.streamEntryFrom(source.source, this.path, {
+        name: source.name,
+        password: source.password,
+        format: source.format,
       });
     }
     return this.#ouch.streamEntry(source.archive, this.path, {
@@ -347,6 +432,84 @@ export class Ouch {
     });
   }
 
+  // -- seekable (random-access) sources ----------------------------------
+
+  /**
+   * List the contents of an archive held by a JS-side [`SeekableSource`].
+   * Only the metadata blocks are pulled from the host (zip central
+   * directory, tar headers, 7z header), so the whole archive never enters
+   * wasm memory. `options.name` (e.g. "archive.zip") is used to infer the
+   * format unless `options.format` is given.
+   */
+  listFrom(
+    source: SeekableSource,
+    options: { name?: string; format?: string; password?: string } = {},
+  ): DecompressEntry[] {
+    const args = seekableArgs(options, "");
+    const raw = this.#wasm.seekable_list(
+      args,
+      readAtOf(source),
+      source.size,
+    ) as RawEntry[];
+    return raw.map((entry) =>
+      new DecompressEntry(this, entry, {
+        kind: "seekable",
+        source,
+        name: options.name ?? "",
+        password: options.password,
+        format: options.format,
+      })
+    );
+  }
+
+  /** Read one entry from an archive held by a JS-side [`SeekableSource`];
+   * only that entry's data is pulled from the host. */
+  readEntryFrom(
+    source: SeekableSource,
+    entry: string,
+    options: { name?: string; format?: string; password?: string } = {},
+  ): Uint8Array {
+    const args = seekableArgs(options, entry);
+    return this.#wasm.seekable_read_entry(args, readAtOf(source), source.size);
+  }
+
+  /** Stream one entry from an archive held by a JS-side [`SeekableSource`]
+   * in bounded chunks (see [`Ouch#streamEntry`]). */
+  streamEntryFrom(
+    source: SeekableSource,
+    entry: string,
+    options: { name?: string; format?: string; password?: string } = {},
+  ): ReadableStream<Uint8Array> {
+    const args = seekableArgs(options, entry);
+    const wasm = this.#wasm;
+    const readAt = readAtOf(source);
+    return new ReadableStream<Uint8Array>({
+      start: (controller) => {
+        try {
+          wasm.seekable_stream_entry(
+            args,
+            readAt,
+            source.size,
+            (chunk: Uint8Array) => {
+              try {
+                controller.enqueue(chunk);
+              } catch {
+                // Consumer cancelled the stream; wasm aborts on the next emit.
+              }
+            },
+          );
+          controller.close();
+        } catch (err) {
+          try {
+            controller.error(err);
+          } catch {
+            // Already cancelled.
+          }
+        }
+      },
+    });
+  }
+
   /**
    * Iterate over archive entries lazily. Nothing is extracted: each
    * yielded entry's `readable`/`bytes` decode just that entry on demand.
@@ -385,6 +548,22 @@ type InitInput =
 
 function toBytes(data: Uint8Array | ArrayBuffer): Uint8Array {
   return data instanceof Uint8Array ? data : new Uint8Array(data);
+}
+
+function seekableArgs(
+  options: { name?: string; format?: string; password?: string },
+  entry: string,
+): SeekableArgs {
+  const args = new SeekableArgs(options.name ?? "", entry);
+  if (options.format !== undefined) args.set_format(options.format);
+  if (options.password !== undefined) args.set_password(options.password);
+  return args;
+}
+
+function readAtOf(
+  source: SeekableSource,
+): (offset: number, length: number) => Uint8Array {
+  return (offset, length) => source.readAt(offset, length);
 }
 
 // ---------------------------------------------------------------------------
