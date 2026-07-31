@@ -69,6 +69,8 @@ const archive = ouch.readFile("docs.tar.gz");
 | `ouch.readEntryFrom(src, e)`    | Read one entry via random access (seek, no full load). |
 | `ouch.streamEntryFrom(src, e)`  | Stream one entry from a seekable source in chunks.     |
 | `ouch.compressTo(files, w)`     | **Stream**-compress JS-owned files into a writable.   |
+| `readFileAsync/writeFileAsync`  | Async whole-file I/O (Deno / Node / browser fetch).  |
+| `fromFileAsync(path)` / `fromBlob(b)` | Async file/Blob -> seekable source.           |
 | `ouch.walk(options)`         | Async-generator over entries, decoded on demand.         |
 | `ouch.clear()`               | Reset the virtual filesystem.                            |
 
@@ -145,7 +147,12 @@ authentication).
   `fromFile`/`fileSink` auto-detect the runtime: Deno's file API first, then
   Node's `node:fs` via `process.getBuiltinModule` (Node ≥ 22.3); pass `node:fs`
   (or a compatible `SyncFs`) explicitly on older Node / bundlers. Browsers
-  have no synchronous file API.
+  have no synchronous file API — use `readFileAsync` / `writeFileAsync` /
+  `fromFileAsync` (promise-based whole-file I/O; Deno / Node auto-detected,
+  browser falls back to `fetch`) or `fromBlob` to load a `File`/`Blob` into a
+  buffered source. Note the wasm parsers are synchronous, so random-access
+  reads during parsing use the sync callbacks; the async helpers cover the
+  I/O around them (loading inputs, writing outputs).
 - **Streaming compression**: `ouch.compressTo(files, writable, options)` (or
   the module-level `compressTo`) pulls each input file from its
   [`SeekableSource`] and pushes 256 KiB output chunks to `writable`, so

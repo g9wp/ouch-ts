@@ -259,6 +259,95 @@ function openNodeFile(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Async file I/O
+// ---------------------------------------------------------------------------
+//
+// The wasm archive parsers are synchronous, so the random-access sources
+// above must stay synchronous. These async helpers cover the I/O *around*
+// them: whole-file reads/writes without blocking the event loop, and loading
+// files into memory for browsers (no synchronous file API).
+
+/**
+ * The promise-based `fs` API subset used by [`readFileAsync`] /
+ * [`writeFileAsync`] / [`fromFileAsync`]. Pass `node:fs/promises` (or a
+ * compatible shim); Deno is detected automatically.
+ */
+export interface AsyncFs {
+  readFile(path: string | URL): Promise<Uint8Array>;
+  writeFile(path: string | URL, data: Uint8Array): Promise<void>;
+}
+
+/** Asynchronously read a whole file (Deno / Node / browser `fetch` for URLs). */
+export async function readFileAsync(
+  path: string | URL,
+  fs?: AsyncFs,
+): Promise<Uint8Array> {
+  return (await asyncFs(fs)).readFile(path);
+}
+
+/** Asynchronously write a whole file (Deno / Node; browsers have no file API). */
+export async function writeFileAsync(
+  path: string | URL,
+  data: Uint8Array,
+  fs?: AsyncFs,
+): Promise<void> {
+  return (await asyncFs(fs)).writeFile(path, data);
+}
+
+/**
+ * Asynchronously load a file into memory and return a buffered seekable
+ * source. Unlike [`fromFile`] (random-access sync handles), this reads the
+ * whole file through async I/O — best for moderate files, and the way to use
+ * disk files from browsers (via `fetch`, or [`fromBlob`]).
+ */
+export async function fromFileAsync(
+  path: string | URL,
+  fs?: AsyncFs,
+): Promise<SeekableSource> {
+  return fromBytes(await readFileAsync(path, fs));
+}
+
+/** A seekable source over a Blob (e.g. a browser `File`), loaded asynchronously. */
+export async function fromBlob(blob: Blob): Promise<SeekableSource> {
+  return fromBytes(new Uint8Array(await blob.arrayBuffer()));
+}
+
+/** Resolve an async fs backend: explicit, Deno, Node, or browser `fetch`. */
+async function asyncFs(fs?: AsyncFs): Promise<AsyncFs> {
+  if (fs) return fs;
+  const deno = (globalThis as unknown as {
+    Deno?: {
+      readFile(p: string | URL): Promise<Uint8Array>;
+      writeFile(p: string | URL, data: Uint8Array): Promise<void>;
+    };
+  }).Deno;
+  if (deno?.readFile) {
+    return {
+      readFile: (p) => deno.readFile(p),
+      writeFile: (p, d) => deno.writeFile(p, d),
+    };
+  }
+  const node = nodeAsyncFs();
+  if (node) return node;
+  return {
+    readFile: async (p) =>
+      new Uint8Array(await (await fetch(String(p))).arrayBuffer()),
+    writeFile: () =>
+      Promise.reject(new Error("no async file-write backend in this runtime")),
+  };
+}
+
+function nodeAsyncFs(): AsyncFs | undefined {
+  const getBuiltin = (globalThis as unknown as {
+    process?: { getBuiltinModule?: (name: string) => unknown };
+  }).process?.getBuiltinModule;
+  if (!getBuiltin) return undefined;
+  return (getBuiltin("node:fs/promises") ?? getBuiltin("fs/promises")) as
+    | AsyncFs
+    | undefined;
+}
+
 export interface CompressOptions {
   /** Paths (in the virtual filesystem) to compress. */
   files: string[];

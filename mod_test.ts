@@ -1,11 +1,15 @@
 import { assert, assertEquals, assertRejects } from "@std/assert";
 import {
   fileSink,
+  fromBlob,
   fromBytes,
   fromFile,
+  fromFileAsync,
   init,
+  readFileAsync,
   type SeekableSource,
   walk,
+  writeFileAsync,
 } from "./mod.ts";
 
 function bytes(text: string): Uint8Array {
@@ -815,6 +819,54 @@ Deno.test("compressTo zip via file sink with encryption", async () => {
   } finally {
     await Deno.remove(tmp);
   }
+});
+
+Deno.test("readFileAsync / writeFileAsync / fromFileAsync roundtrip", async () => {
+  const ouch = await init();
+  ouch.clear();
+
+  ouch.writeFile("a.txt", bytes("async file io"));
+  ouch.compress({ files: ["a.txt"], output: "a.zip" });
+  const archive = ouch.readFile("a.zip");
+
+  const tmp = await Deno.makeTempFile({ suffix: ".zip" });
+  try {
+    await writeFileAsync(tmp, archive);
+    assertEquals(await readFileAsync(tmp), archive);
+
+    const src = await fromFileAsync(tmp);
+    const entries = ouch.listFrom(src, { name: "a.zip" });
+    assertEquals(entries.map((e) => e.path), ["a.txt"]);
+    assertEquals(text(entries[0].bytes), "async file io");
+  } finally {
+    await Deno.remove(tmp);
+  }
+});
+
+Deno.test("fromFileAsync works through a node:fs/promises backend", async () => {
+  const promises = await import("node:fs/promises");
+  const tmp = await Deno.makeTempFile();
+  try {
+    await Deno.writeFile(tmp, bytes("node promises"));
+    const src = await fromFileAsync(tmp, promises);
+    assertEquals(text(src.readAt(0, 13)), "node promises");
+  } finally {
+    await Deno.remove(tmp);
+  }
+});
+
+Deno.test("fromBlob loads a Blob into a seekable source", async () => {
+  const ouch = await init();
+  ouch.clear();
+
+  ouch.writeFile("doc.txt", bytes("blob source"));
+  ouch.compress({ files: ["doc.txt"], output: "b.zip" });
+  const blob = new Blob([ouch.readFile("b.zip").buffer as ArrayBuffer]);
+
+  const src = await fromBlob(blob);
+  const entries = ouch.listFrom(src, { name: "b.zip" });
+  assertEquals(entries.map((e) => e.path), ["doc.txt"]);
+  assertEquals(text(entries[0].bytes), "blob source");
 });
 
 function assertThrows(fn: () => unknown): void {
