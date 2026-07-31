@@ -13,6 +13,7 @@ import initWasm, {
   ListArgs,
   OuchWasm,
   ReadEntryArgs,
+  StreamEntryArgs,
 } from "./pkg/ouch.js";
 
 // ---------------------------------------------------------------------------
@@ -147,13 +148,37 @@ export class DecompressEntry {
     });
   }
 
-  /** The entry's contents as a Web stream (decoded on first read). */
+  /** The entry's contents as a Web stream.
+   *
+   * For archive-backed entries this is a **true streaming** read: the entry is
+   * decoded in bounded chunks inside wasm and pushed chunk by chunk, so memory
+   * stays at chunk size even for huge entries (7z/rar entries are decoded
+   * through their libraries' sequential readers). VFS-backed entries (already
+   * extracted) are emitted as a single chunk. */
   get readable(): ReadableStream<Uint8Array> {
-    return new ReadableStream<Uint8Array>({
-      start: (controller) => {
-        controller.enqueue(this.bytes);
-        controller.close();
-      },
+    if (this.isDir || this.isSymlink) {
+      return new ReadableStream<Uint8Array>({
+        start: (controller) => {
+          controller.enqueue(new Uint8Array(0));
+          controller.close();
+        },
+      });
+    }
+    const source = this.#source;
+    if (source === null) {
+      throw new Error(`entry "${this.path}" has no readable contents`);
+    }
+    if (source.kind === "vfs") {
+      return new ReadableStream<Uint8Array>({
+        start: (controller) => {
+          controller.enqueue(this.#ouch.readFile(source.path));
+          controller.close();
+        },
+      });
+    }
+    return this.#ouch.streamEntry(source.archive, this.path, {
+      password: source.password,
+      format: source.format,
     });
   }
 }
@@ -282,6 +307,44 @@ export class Ouch {
     if (options.password !== undefined) args.set_password(options.password);
     if (options.format !== undefined) args.set_format(options.format);
     return this.#wasm.read_entry(args);
+  }
+
+  /**
+   * Stream one entry's contents out of an archive (or a single-file format)
+   * in bounded chunks. The underlying wasm call runs synchronously once the
+   * stream is constructed, pushing each chunk into the stream; `entry` is
+   * ignored for single-file formats (gz, xz, bz2, ...). Prefer this over
+   * [`Ouch#readEntry`] for large files.
+   */
+  streamEntry(
+    archive: string,
+    entry: string,
+    options: { password?: string; format?: string } = {},
+  ): ReadableStream<Uint8Array> {
+    const args = new StreamEntryArgs(archive, entry);
+    if (options.password !== undefined) args.set_password(options.password);
+    if (options.format !== undefined) args.set_format(options.format);
+    const wasm = this.#wasm;
+    return new ReadableStream<Uint8Array>({
+      start: (controller) => {
+        try {
+          wasm.stream_entry(args, (chunk: Uint8Array) => {
+            try {
+              controller.enqueue(chunk);
+            } catch {
+              // Consumer cancelled the stream; wasm aborts on the next emit.
+            }
+          });
+          controller.close();
+        } catch (err) {
+          try {
+            controller.error(err);
+          } catch {
+            // Already cancelled.
+          }
+        }
+      },
+    });
   }
 
   /**

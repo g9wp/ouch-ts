@@ -280,6 +280,92 @@ Deno.test("rar decompress (fixture created with the rars writer)", async () => {
   );
 });
 
+async function collectStream(
+  stream: ReadableStream<Uint8Array>,
+): Promise<Uint8Array[]> {
+  const chunks: Uint8Array[] = [];
+  const reader = stream.getReader();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+  }
+  return chunks;
+}
+
+function joinChunks(chunks: Uint8Array[]): Uint8Array {
+  const joined = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+  let offset = 0;
+  for (const chunk of chunks) {
+    joined.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return joined;
+}
+
+Deno.test("streamEntry streams a large zip entry in chunks", async () => {
+  const ouch = await init();
+  ouch.clear();
+
+  // ~2 MiB payload: big enough to be split into several 256 KiB chunks.
+  const payload = bytes("0123456789abcdef".repeat(128 * 1024));
+  assertEquals(payload.length, 2 * 1024 * 1024);
+  ouch.writeFile("big.bin", payload);
+  ouch.compress({ files: ["big.bin"], output: "big.zip" });
+
+  const [entry] = ouch.listArchive({ archives: ["big.zip"] });
+  assertEquals(entry.path, "big.bin");
+  assertEquals(entry.size, payload.length);
+
+  const chunks = await collectStream(entry.readable);
+  assert(chunks.length > 1, "expected multiple chunks");
+  for (const chunk of chunks) {
+    assert(chunk.length <= 256 * 1024, "chunk exceeds the chunk size");
+  }
+  assertEquals(joinChunks(chunks), payload);
+});
+
+Deno.test("streamEntry decodes a tar.gz chain without buffering", async () => {
+  const ouch = await init();
+  ouch.clear();
+
+  const content = bytes("streamed through tar.gz".repeat(200));
+  ouch.writeFile("in/doc.txt", content);
+  ouch.compress({ files: ["in"], output: "docs.tar.gz" });
+
+  const entries = ouch.listArchive({ archives: ["docs.tar.gz"] });
+  const doc = entries.find((e) => e.path === "in/doc.txt")!;
+  assertEquals(joinChunks(await collectStream(doc.readable)), content);
+});
+
+Deno.test("streamEntry streams the rar fixture entry", async () => {
+  const ouch = await init();
+  ouch.clear();
+
+  ouch.writeFile("sample.rar", await Deno.readFile("./fixtures/sample.rar"));
+  const [entry] = ouch.listArchive({ archives: ["sample.rar"] });
+  const chunks = await collectStream(entry.readable);
+  assertEquals(
+    text(joinChunks(chunks)),
+    "the quick brown fox jumps over the lazy dog. ".repeat(8),
+  );
+});
+
+Deno.test("streamEntry decodes a single-file gz", async () => {
+  const ouch = await init();
+  ouch.clear();
+
+  const content = bytes("single file stream".repeat(500));
+  ouch.writeFile("a.txt", content);
+  ouch.compress({ files: ["a.txt"], output: "a.txt.gz" });
+
+  // For single-file formats the entry name is ignored.
+  const chunks = await collectStream(
+    ouch.streamEntry("a.txt.gz", "ignored"),
+  );
+  assertEquals(joinChunks(chunks), content);
+});
+
 function assertThrows(fn: () => unknown): void {
   let threw = false;
   try {

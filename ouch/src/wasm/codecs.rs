@@ -123,33 +123,40 @@ pub fn encode(format: CompressionFormat, input: &[u8], level: Option<i16>) -> Re
     }
 }
 
-/// Decompress `input` with a single non-archive format.
-pub fn decode(format: CompressionFormat, input: &[u8]) -> Result<Vec<u8>> {
-    let reader = Cursor::new(input);
-    let decoder: Box<dyn Read> = match format {
-        CompressionFormat::Gzip => Box::new(flate2::read::MultiGzDecoder::new(reader)),
-        CompressionFormat::Bzip => Box::new(bzip2_rs::DecoderReader::new(reader)),
-        CompressionFormat::Xz => Box::new(lzma_rust2::XzReader::new(reader, true)),
-        CompressionFormat::Lzma => Box::new(lzma_rust2::LzmaReader::new_mem_limit(
+/// Wrap `reader` with the streaming decoder for `format`. This is the
+/// reader-wrapping counterpart of [`decode`] and lets callers chain decoders
+/// (e.g. tar over gz) without materializing the intermediate layers.
+pub fn wrap_decoder<'a>(
+    format: CompressionFormat,
+    reader: Box<dyn Read + 'a>,
+) -> Result<Box<dyn Read + 'a>> {
+    match format {
+        CompressionFormat::Gzip => Ok(Box::new(flate2::read::MultiGzDecoder::new(reader))),
+        CompressionFormat::Bzip => Ok(Box::new(bzip2_rs::DecoderReader::new(reader))),
+        CompressionFormat::Xz => Ok(Box::new(lzma_rust2::XzReader::new(reader, true))),
+        CompressionFormat::Lzma => Ok(Box::new(lzma_rust2::LzmaReader::new_mem_limit(
             reader,
             LZMA_MEMLIMIT_BYTES,
             None,
-        )?),
-        CompressionFormat::Lzip => Box::new(lzma_rust2::LzipReader::new(reader)),
-        CompressionFormat::Lz4 => Box::new(MultiFrameLz4Decoder::new(reader)),
-        CompressionFormat::Snappy => Box::new(snap::read::FrameDecoder::new(reader)),
-        CompressionFormat::Brotli => Box::new(brotli::Decompressor::new(reader, BUFFER_CAPACITY)),
+        )?)),
+        CompressionFormat::Lzip => Ok(Box::new(lzma_rust2::LzipReader::new(reader))),
+        CompressionFormat::Lz4 => Ok(Box::new(MultiFrameLz4Decoder::new(reader))),
+        CompressionFormat::Snappy => Ok(Box::new(snap::read::FrameDecoder::new(reader))),
+        CompressionFormat::Brotli => Ok(Box::new(brotli::Decompressor::new(reader, BUFFER_CAPACITY))),
         // ruzstd decodes a single zstd frame (concatenated-frame files need
         // manual frame skipping; rare in practice).
-        CompressionFormat::Zstd => Box::new(
+        CompressionFormat::Zstd => Ok(Box::new(
             ruzstd::decoding::StreamingDecoder::new(reader).map_err(|e| crate::Error::Custom {
                 reason: FinalError::with_title("failed to decode zstd header").detail(format!("{e:?}")),
             })?,
-        ),
-        other => return Err(unavailable(other.as_str())),
-    };
+        )),
+        other => Err(unavailable(other.as_str())),
+    }
+}
 
+/// Decompress `input` with a single non-archive format.
+pub fn decode(format: CompressionFormat, input: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    copy_limited_decompression(decoder, &mut out)?;
+    copy_limited_decompression(wrap_decoder(format, Box::new(Cursor::new(input)))?, &mut out)?;
     Ok(out)
 }

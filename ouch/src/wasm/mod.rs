@@ -10,4 +10,7 @@ pub mod codecs;
 pub mod entry;
 pub mod vfs;
 
+/// Chunk size used by the streaming entry reader ([`crate::wasm::entry::OuchWasm::stream_entry`]).
+pub const STREAM_CHUNK_SIZE: usize = 256 * 1024;
+
 pub use entry::OuchWasm;

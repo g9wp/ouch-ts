@@ -6,7 +6,7 @@
 //! filesystem stores.
 
 use std::{
-    io::{self, Cursor, Read, Write},
+    io::{self, Cursor, Read, Seek, Write},
     path::{Path, PathBuf},
 };
 
@@ -565,6 +565,157 @@ fn add_implicit_dirs(entries: &mut Vec<Entry>) {
         });
     }
     entries.sort_by(|a, b| a.path.cmp(&b.path));
+}
+
+// ---------------------------------------------------------------------------
+// streaming reads
+// ---------------------------------------------------------------------------
+
+/// Stream `reader`'s contents to `emit` in bounded chunks. An `Err` from
+/// `emit` (e.g. the JS consumer cancelled) aborts the read immediately.
+pub fn pump_read<R: Read>(reader: &mut R, emit: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+    let mut buf = vec![0u8; crate::wasm::STREAM_CHUNK_SIZE];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            return Ok(());
+        }
+        emit(&buf[..n])?;
+    }
+}
+
+/// Stream one entry's contents out of an in-memory zip archive in chunks.
+pub fn pump_zip_entry<R: Read + Seek>(
+    input: R,
+    password: Option<&[u8]>,
+    entry_name: &str,
+    emit: &mut dyn FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    let mut archive = zip::ZipArchive::new(input)?;
+    for idx in 0..archive.len() {
+        let mut file = match password {
+            Some(password) => archive.by_index_decrypt(idx, password)?,
+            None => archive.by_index(idx)?,
+        };
+        let Some(enclosed) = file.enclosed_name() else { continue };
+        if normalize_name(&enclosed) != entry_name {
+            continue;
+        }
+        if file.is_dir() {
+            return Ok(());
+        }
+        return pump_read(&mut file, emit);
+    }
+    Err(entry_not_found(entry_name))
+}
+
+/// Stream one entry's contents out of an in-memory tar archive in chunks.
+/// `input` may already be a chained decoder (e.g. gz under tar).
+pub fn pump_tar_entry<R: Read>(
+    input: R,
+    entry_name: &str,
+    emit: &mut dyn FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    let mut archive = tar::Archive::new(input);
+    for file in archive.entries()? {
+        let mut file = file?;
+        let raw_path = file.path()?.into_owned();
+        if normalize_name(&raw_path) != entry_name {
+            continue;
+        }
+        return match file.header().entry_type() {
+            tar::EntryType::Directory => Ok(()),
+            tar::EntryType::Symlink | tar::EntryType::Link => {
+                let target = file.link_name()?.unwrap_or_default().into_owned();
+                emit(target.to_string_lossy().into_owned().as_bytes())
+            }
+            _ => pump_read(&mut file, emit),
+        };
+    }
+    Err(entry_not_found(entry_name))
+}
+
+/// Stream one entry's contents out of an in-memory 7z archive in chunks.
+///
+/// sevenz-rust2 exposes no streaming single-entry reader, so the entry is
+/// decoded (only its needed blocks) and emitted in chunks.
+pub fn pump_7z_entry(
+    input: &[u8],
+    password: Option<&[u8]>,
+    entry_name: &str,
+    emit: &mut dyn FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    let data = read_7z_entry(input, password, entry_name)?;
+    for chunk in data.chunks(crate::wasm::STREAM_CHUNK_SIZE) {
+        emit(chunk)?;
+    }
+    Ok(())
+}
+
+/// Stream one entry's contents out of an in-memory rar archive in chunks.
+///
+/// rars decodes sequentially via [`rars::Archive::extract_to`]; non-target
+/// members are discarded through a null sink while the target's bytes are
+/// emitted (bounded memory, solid archives included).
+pub fn pump_rar_entry(
+    input: &[u8],
+    password: Option<&[u8]>,
+    entry_name: &str,
+    emit: Box<dyn FnMut(&[u8]) -> Result<()>>,
+) -> Result<()> {
+    use std::{cell::{Cell, RefCell}, rc::Rc};
+
+    struct Sink {
+        emit: Rc<RefCell<Box<dyn FnMut(&[u8]) -> Result<()>>>>,
+        failed: Rc<Cell<bool>>,
+    }
+
+    impl Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.emit.borrow_mut()(buf).is_err() {
+                self.failed.set(true);
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let archive = parse_rar(input, password)?;
+    let emit = Rc::new(RefCell::new(emit));
+    let failed = Rc::new(Cell::new(false));
+    let found = Rc::new(Cell::new(false));
+
+    {
+        let emit_ref = Rc::clone(&emit);
+        let failed_ref = Rc::clone(&failed);
+        let found_ref = Rc::clone(&found);
+        archive
+            .extract_to(password, |meta| {
+                let name = String::from_utf8_lossy(&meta.name).replace('\\', "/");
+                if name != entry_name || meta.is_directory {
+                    return Ok(Box::new(io::sink()));
+                }
+                found_ref.set(true);
+                Ok(Box::new(Sink {
+                    emit: Rc::clone(&emit_ref),
+                    failed: Rc::clone(&failed_ref),
+                }) as Box<dyn Write>)
+            })
+            .map_err(rar_err)?;
+    }
+
+    if failed.get() {
+        return Err(crate::Error::Custom {
+            reason: FinalError::with_title("stream was cancelled"),
+        });
+    }
+    if found.get() {
+        Ok(())
+    } else {
+        Err(entry_not_found(entry_name))
+    }
 }
 
 // ---------------------------------------------------------------------------

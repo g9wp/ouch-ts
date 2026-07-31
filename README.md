@@ -64,6 +64,7 @@ const archive = ouch.readFile("docs.tar.gz");
 | `ouch.decompress(options)`   | Extract archives into the VFS.                           |
 | `ouch.listArchive(options)`  | List archive entries; `bytes`/`readable` decode lazily.  |
 | `ouch.readEntry(archive, e)` | Read one entry's bytes from an archive.                  |
+| `ouch.streamEntry(archive, e)` | **Stream** one entry in bounded chunks (large files).  |
 | `ouch.walk(options)`         | Async-generator over entries, decoded on demand.         |
 | `ouch.clear()`               | Reset the virtual filesystem.                            |
 
@@ -119,6 +120,14 @@ authentication).
 - `walk` and `listArchive` are fully lazy: entry `bytes`/`readable` decode
   only that entry from the archive on demand. `decompress` materializes
   entries into the VFS instead.
+- **Streaming reads for large files**: `entry.readable` (from `listArchive` /
+  `walk`) and `ouch.streamEntry()` are true streams — wasm decodes the entry
+  in 256 KiB chunks and pushes each chunk to JS, so memory stays bounded no
+  matter how big the uncompressed entry is. This works for every format
+  (`tar.gz` chains are decoded as one stream). 7z/rar entries go through their
+  libraries' sequential readers, so they are not random-access.
+  `readEntry()` / `entry.bytes` / `decompress()` still materialize the whole
+  entry in memory — prefer streaming for anything large.
 - `password` enables AES-256 encryption when compressing to zip/7z;
   encrypted archives need it to list, read or extract. `level` (0-9) applies
   to zip (deflate), 7z (LZMA2) and the streaming formats.

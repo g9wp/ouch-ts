@@ -163,6 +163,13 @@ impl OuchWasm {
     pub fn read_entry(args: ReadEntryArgs) -> Result<Vec<u8>, JsError> {
         run_read_entry(&args).map_err(js_error)
     }
+
+    /// Stream one entry's contents out of an archive (or single-file format)
+    /// in bounded chunks. `on_chunk` is called once per chunk with a fresh
+    /// `Uint8Array`; the call returns after the last chunk.
+    pub fn stream_entry(args: StreamEntryArgs, on_chunk: js_sys::Function) -> Result<(), JsError> {
+        run_stream_entry(&args, on_chunk).map_err(js_error)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -310,12 +317,47 @@ impl ReadEntryArgs {
         }
     }
 
+    pub fn set_password(&mut self, password: String) {
+        self.password = Some(password);
+    }
+
     pub fn set_format(&mut self, format: String) {
         self.format = Some(format);
+    }
+}
+
+/// Arguments for [`OuchWasm::stream_entry`]. For single-file formats (gz, xz,
+/// bz2, ...) `entry` is ignored.
+#[wasm_bindgen]
+#[derive(Default)]
+pub struct StreamEntryArgs {
+    #[wasm_bindgen(skip)]
+    pub archive: String,
+    #[wasm_bindgen(skip)]
+    pub entry: String,
+    #[wasm_bindgen(skip)]
+    pub password: Option<String>,
+    #[wasm_bindgen(skip)]
+    pub format: Option<String>,
+}
+
+#[wasm_bindgen]
+impl StreamEntryArgs {
+    #[wasm_bindgen(constructor)]
+    pub fn new(archive: String, entry: String) -> Self {
+        Self {
+            archive,
+            entry,
+            ..Default::default()
+        }
     }
 
     pub fn set_password(&mut self, password: String) {
         self.password = Some(password);
+    }
+
+    pub fn set_format(&mut self, format: String) {
+        self.format = Some(format);
     }
 }
 
@@ -668,5 +710,62 @@ fn run_read_entry(args: &ReadEntryArgs) -> Result<Vec<u8>> {
         CompressionFormat::Rar => archives::read_rar_entry(&decoded, password, &entry_name),
         // A single non-archive file is its own only "entry".
         non_archive => codecs::decode(non_archive, &decoded),
+    }
+}
+
+/// Chain the `rest` codec decoders around `input`, outermost layer first.
+/// E.g. for "tar.gz.xz" (`rest = [Gzip, Xz]`) this wraps xz, then gz.
+fn chain_input_reader<'a>(input: &'a [u8], rest: &[CompressionFormat]) -> Result<Box<dyn std::io::Read + 'a>> {
+    let mut reader: Box<dyn std::io::Read + 'a> = Box::new(std::io::Cursor::new(input));
+    for format in rest.iter().rev() {
+        reader = codecs::wrap_decoder(*format, reader)?;
+    }
+    Ok(reader)
+}
+
+/// Stream one entry's (or a single file's) contents to `on_chunk` in bounded
+/// chunks. Decoder state lives entirely inside this call, so wasm memory stays
+/// at chunk size regardless of the entry's uncompressed size (7z and rar are
+/// inherently sequential and decode through their own whole-member readers).
+fn run_stream_entry(args: &StreamEntryArgs, on_chunk: js_sys::Function) -> Result<()> {
+    let formats = format_from_path_or_flag(&args.archive, args.format.as_deref())?;
+    let (first, rest) = split_first_compression_format(&formats);
+    let input = read_input(&args.archive)?;
+    let password = args.password.as_deref().map(|p| p.as_bytes());
+    let entry_name = args.entry.replace('\\', "/");
+
+    // A failed JS call means the consumer cancelled the stream.
+    let mut emit = move |chunk: &[u8]| -> Result<()> {
+        let js = js_sys::Uint8Array::from(chunk);
+        on_chunk.call1(&JsValue::NULL, &js).map_err(|e| crate::Error::Custom {
+            reason: FinalError::with_title("stream was cancelled").detail(format!("{e:?}")),
+        })?;
+        Ok(())
+    };
+
+    match first {
+        CompressionFormat::Tar => {
+            let reader = chain_input_reader(&input, &rest)?;
+            archives::pump_tar_entry(reader, &entry_name, &mut emit)
+        }
+        CompressionFormat::Zip => {
+            // Zip needs a seekable source; decode any wrapping layers first.
+            let decoded = if rest.is_empty() { input } else { decode_layers(&input, &rest)? };
+            archives::pump_zip_entry(std::io::Cursor::new(decoded), password, &entry_name, &mut emit)
+        }
+        CompressionFormat::SevenZip => {
+            let decoded = if rest.is_empty() { input } else { decode_layers(&input, &rest)? };
+            archives::pump_7z_entry(&decoded, password, &entry_name, &mut emit)
+        }
+        CompressionFormat::Rar => {
+            let decoded = if rest.is_empty() { input } else { decode_layers(&input, &rest)? };
+            archives::pump_rar_entry(&decoded, password, &entry_name, Box::new(emit))
+        }
+        non_archive => {
+            // Single-stream formats chain every codec without buffering.
+            let mut reader = chain_input_reader(&input, &rest)?;
+            reader = codecs::wrap_decoder(non_archive, reader)?;
+            archives::pump_read(&mut reader, &mut emit)
+        }
     }
 }
