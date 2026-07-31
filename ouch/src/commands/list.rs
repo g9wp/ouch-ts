@@ -1,0 +1,162 @@
+use std::{
+    io::{self, BufReader, Read},
+    path::Path,
+};
+
+use fs_err as fs;
+
+use crate::{
+    BUFFER_CAPACITY, QuestionAction, QuestionPolicy, Result, archive,
+    commands::warn_user_about_loading_zip_in_memory,
+    extension::CompressionFormat::{self, *},
+    list::{self, FileInArchive, ListOptions},
+    non_archive::lz4::MultiFrameLz4Decoder,
+    utils::{
+        LZMA_MEMLIMIT_BYTES, LimitedReader, copy_limited_decompression, io::lock_and_flush_output_stdio,
+        user_wants_to_continue,
+    },
+};
+
+/// File at archive_path is opened for reading, example: "archive.tar.gz"
+/// formats contains each format necessary for decompression, example: [Gz, Tar] (in decompression order)
+pub fn list_archive_contents(
+    archive_path: &Path,
+    formats: Vec<CompressionFormat>,
+    list_options: ListOptions,
+    question_policy: QuestionPolicy,
+    password: Option<&[u8]>,
+    // Pre-opened tempfile FD for multi-format RAR list under the sandbox.
+    #[allow(unused_variables)] rar_spill_tempfile: Option<tempfile::NamedTempFile>,
+) -> Result<()> {
+    let reader = fs::File::open(archive_path)?;
+
+    // Zip archives are special, because they require io::Seek, so it requires its logic separated
+    // from decoder chaining.
+    //
+    // This is the only case where we can read and unpack it directly, without having to do
+    // in-memory decompression/copying first.
+    //
+    // Any other Zip decompression done can take up the whole RAM and freeze ouch.
+    if let &[Zip] = formats.as_slice() {
+        let zip_archive = zip::ZipArchive::new(reader)?;
+        let files = crate::archive::zip::list_archive(zip_archive, password);
+        list::list_files(archive_path, files, list_options)?;
+        return Ok(());
+    }
+
+    // Will be used in decoder chaining
+    let reader = BufReader::with_capacity(BUFFER_CAPACITY, reader);
+    let mut reader: Box<dyn Read + Send> = Box::new(reader);
+
+    // Grab previous decoder and wrap it inside of a new one
+    let chain_reader_decoder =
+        |format: CompressionFormat, decoder: Box<dyn Read + Send>| -> Result<Box<dyn Read + Send>> {
+            let decoder: Box<dyn Read + Send> = match format {
+                Gzip => Box::new(flate2::read::MultiGzDecoder::new(decoder)),
+                Bzip => Box::new(bzip2::read::MultiBzDecoder::new(decoder)),
+                Bzip3 => {
+                    #[cfg(not(feature = "bzip3"))]
+                    return Err(crate::Error::bzip3_no_support());
+
+                    #[cfg(feature = "bzip3")]
+                    Box::new(bzip3::read::Bz3Decoder::new(decoder)?)
+                }
+                Lz4 => Box::new(MultiFrameLz4Decoder::new(decoder)),
+                Lzma => Box::new(lzma_rust2::LzmaReader::new_mem_limit(
+                    decoder,
+                    LZMA_MEMLIMIT_BYTES,
+                    None,
+                )?),
+                Xz => Box::new(lzma_rust2::XzReader::new(decoder, true)),
+                Lzip => Box::new(lzma_rust2::LzipReader::new(decoder)),
+                Snappy => Box::new(snap::read::FrameDecoder::new(decoder)),
+                Zstd => Box::new(zstd::stream::Decoder::new(decoder)?),
+                Brotli => Box::new(brotli::Decompressor::new(decoder, BUFFER_CAPACITY)),
+                Tar | Zip | Rar | SevenZip => unreachable!("should be treated by caller"),
+            };
+            Ok(decoder)
+        };
+
+    let mut misplaced_archive_format = None;
+    for &format in formats.iter().skip(1).rev() {
+        if format.is_archive_format() {
+            misplaced_archive_format = Some(format);
+            break;
+        }
+        reader = chain_reader_decoder(format, reader)?;
+    }
+
+    let archive_format = misplaced_archive_format.unwrap_or(formats[0]);
+    let files: Box<dyn Iterator<Item = Result<FileInArchive>>> = match archive_format {
+        Tar => {
+            let limited = LimitedReader::new(reader);
+            Box::new(crate::archive::tar::list_archive(tar::Archive::new(limited))?)
+        }
+        Zip => {
+            if formats.len() > 1 {
+                // Make thread own locks to keep output messages adjacent
+                let _locks = lock_and_flush_output_stdio();
+
+                warn_user_about_loading_zip_in_memory();
+                if !user_wants_to_continue(archive_path, question_policy, QuestionAction::Decompression)? {
+                    return Ok(());
+                }
+            }
+
+            let mut vec = vec![];
+            // Bomb cap: abort if the in-memory decompressed image exceeds the limit
+            copy_limited_decompression(&mut reader, &mut vec)?;
+            let zip_archive = zip::ZipArchive::new(io::Cursor::new(vec))?;
+
+            Box::new(crate::archive::zip::list_archive(zip_archive, password))
+        }
+        #[cfg(feature = "unrar")]
+        Rar => {
+            if formats.len() > 1 {
+                // The caller pre-opens this tempfile before the sandbox starts.
+                let mut temp_file = match rar_spill_tempfile {
+                    Some(temp_file) => temp_file,
+                    None => {
+                        return Err(crate::error::FinalError::with_title("Failed to list RAR archive")
+                            .detail("the sandbox spill tempfile was not prepared before lockdown")
+                            .into());
+                    }
+                };
+                // Bomb cap: abort if decompressed output to tempfile exceeds the limit
+                copy_limited_decompression(&mut reader, &mut temp_file)?;
+                Box::new(crate::archive::rar::list_archive(temp_file.path(), password)?)
+            } else {
+                Box::new(crate::archive::rar::list_archive(archive_path, password)?)
+            }
+        }
+        #[cfg(not(feature = "unrar"))]
+        Rar => {
+            return Err(crate::Error::rar_no_support());
+        }
+        SevenZip => {
+            if formats.len() > 1 {
+                // Make thread own locks to keep output messages adjacent
+                let locks = lock_and_flush_output_stdio();
+                warn_user_about_loading_zip_in_memory();
+                if !user_wants_to_continue(archive_path, question_policy, QuestionAction::Decompression)? {
+                    return Ok(());
+                }
+                drop(locks);
+
+                let mut vec = vec![];
+                // Bomb cap: abort if the in-memory decompressed image exceeds the limit
+                copy_limited_decompression(&mut reader, &mut vec)?;
+
+                Box::new(archive::sevenz::list_archive(io::Cursor::new(vec), password)?)
+            } else {
+                // If it's the only format, we can read the archive directly.
+                Box::new(archive::sevenz::list_archive(fs::File::open(archive_path)?, password)?)
+            }
+        }
+        Gzip | Bzip | Bzip3 | Lz4 | Lzma | Xz | Lzip | Snappy | Zstd | Brotli => {
+            unreachable!("Not an archive, should be validated before calling this function.");
+        }
+    };
+
+    list::list_files(archive_path, files, list_options)
+}

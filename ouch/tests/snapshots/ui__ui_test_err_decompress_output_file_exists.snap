@@ -1,0 +1,5 @@
+---
+source: tests/ui.rs
+expression: "run_ouch_with_stdin(\"ouch decompress out.gz\", dir, Some(\"s\\n\"))"
+---
+Handle file conflict for "out": [(R)ename/(m)erge/(o)verwrite/(s)kip]

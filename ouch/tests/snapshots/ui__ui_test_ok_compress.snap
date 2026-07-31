@@ -1,0 +1,7 @@
+---
+source: tests/ui.rs
+expression: "run_ouch(\"ouch compress input output.zip\", dir)"
+---
+[INFO] Compressing "input"
+[INFO] Output file size: [SIZE]
+[INFO] Successfully compressed to "output.zip"

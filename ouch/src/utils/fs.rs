@@ -1,0 +1,503 @@
+//! Filesystem utility functions.
+
+use std::{
+    borrow::Cow,
+    env,
+    io::{self, Read, Write},
+    path::{Path, PathBuf},
+};
+
+use fs_err::{self as fs, PathExt};
+use same_file::Handle;
+
+use super::{question::FileConflitOperation, user_wants_to_overwrite};
+use crate::{
+    FinalError, QuestionPolicy, Result,
+    error::Error,
+    extension::CompressionFormat,
+    info_accessible,
+    utils::{PathFmt, QuestionAction, strip_path_ascii_prefix},
+};
+
+pub fn is_path_stdin(path: &Path) -> bool {
+    path.as_os_str() == "-"
+}
+
+/// Check if &Path exists, if it does then ask the user if they want to overwrite or rename it.
+/// If the user want to overwrite then the file or directory will be removed and returned the same input path
+/// If the user want to rename then nothing will be removed and a new path will be returned with a new name
+///
+/// * `Ok(None)` means the user wants to cancel the operation
+/// * `Ok(Some(path))` returns a valid PathBuf without any another file or directory with the same name
+/// * `Err(_)` is an error
+pub fn resolve_path_conflict(
+    path: &Path,
+    question_policy: QuestionPolicy,
+    question_action: QuestionAction,
+) -> Result<Option<PathBuf>> {
+    if path.fs_err_try_exists()? {
+        match user_wants_to_overwrite(path, question_policy, question_action)? {
+            FileConflitOperation::Cancel => Ok(None),
+            FileConflitOperation::Overwrite => {
+                remove_file_or_dir(path)?;
+                Ok(Some(path.to_path_buf()))
+            }
+            FileConflitOperation::Rename => Ok(Some(find_available_filename_by_renaming(path)?)),
+            FileConflitOperation::Merge => Ok(Some(path.to_path_buf())),
+        }
+    } else {
+        Ok(Some(path.to_path_buf()))
+    }
+}
+
+pub fn remove_file_or_dir(path: &Path) -> Result<()> {
+    if path.is_dir() {
+        if let Ok(cwd) = env::current_dir()
+            && matches!(
+                (Handle::from_path(path), Handle::from_path(&cwd)),
+                (Ok(a), Ok(b)) if a == b
+            )
+        {
+            return Err(
+                FinalError::with_title("Refusing to delete the current working directory")
+                    .detail(format!("Path {} is the current directory", PathFmt(path)))
+                    .hint("Use a different output directory with `--dir` / `-d`")
+                    .into(),
+            );
+        }
+        fs::remove_dir_all(path)?;
+    } else if path.is_file() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+pub fn file_size(path: &Path) -> Result<u64> {
+    Ok(fs::metadata(path)?.len())
+}
+
+/// Say you want to write to `archive.tar.gz` but that already exists.
+///
+/// So the user chooses to `rename` to avoid the conflict (keep both files).
+///
+/// In this scenario, this function will return `archive_1.tar.gz`, subsequent
+/// calls will keep incrementing the number:
+///
+/// - archive_1.tar.gz
+/// - archive_2.tar.gz
+/// - archive_3.tar.gz
+pub fn find_available_filename_by_renaming(path: &Path) -> Result<PathBuf> {
+    fn create_path_with_given_index(path: &Path, i: usize) -> PathBuf {
+        let parent = path.parent().unwrap_or_else(|| Path::new(""));
+        let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+
+        let new_filename = match file_name.split_once('.') {
+            Some((stem, extension)) if !stem.is_empty() => format!("{stem}_{i}.{extension}"),
+            _ => format!("{file_name}_{i}"),
+        };
+
+        parent.join(new_filename)
+    }
+
+    for i in 1.. {
+        let renamed_path = create_path_with_given_index(path, i);
+        if !renamed_path.fs_err_try_exists()? {
+            return Ok(renamed_path);
+        }
+    }
+    unreachable!()
+}
+
+/// Creates a directory at the path, if there is nothing there.
+pub fn create_dir_if_non_existent(path: &Path) -> Result<()> {
+    if !path.fs_err_try_exists()? {
+        fs::create_dir_all(path)?;
+        info_accessible!("Directory {} created", PathFmt(path));
+    }
+    Ok(())
+}
+
+/// Ensures the parent directory of a file path exists, creating it if necessary.
+/// Lexically normalize a relative path; returns None on absolute or escape via `..`.
+pub fn normalize_safe_path(path: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            std::path::Component::Normal(c) => out.push(c),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Reject ZipSlip-style entry paths; returns the lexically-normalized safe form.
+pub fn validate_entry_path(path: &Path) -> Result<PathBuf> {
+    normalize_safe_path(path).ok_or_else(|| {
+        FinalError::with_title("refusing to extract archive entry with unsafe path")
+            .detail(format!("entry: {}", PathFmt(path)))
+            .into()
+    })
+}
+
+/// Reject symlink targets whose relative path would escape the extraction root.
+pub fn validate_symlink_target(link_relpath: &Path, target: &Path) -> Result<()> {
+    if target.is_absolute() {
+        return Ok(());
+    }
+    let parent = link_relpath.parent().unwrap_or(Path::new(""));
+    if normalize_safe_path(&parent.join(target)).is_none() {
+        return Err(
+            FinalError::with_title("refusing to create symlink escaping extraction root")
+                .detail(format!("link: {}  target: {}", PathFmt(link_relpath), PathFmt(target)))
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// Refuse to write through an on-disk symlink created by an earlier entry.
+/// Walks every existing prefix between root and dest and errors if any component is a symlink.
+pub fn validate_dest_inside_root(root: &Path, dest: &Path) -> Result<()> {
+    let rel = dest.strip_prefix(root).map_err(|_| {
+        FinalError::with_title("refusing to write outside extraction root").detail(format!("dest: {}", PathFmt(dest)))
+    })?;
+    let mut probe = root.to_path_buf();
+    for comp in rel.components() {
+        probe.push(comp);
+        match fs::symlink_metadata(&probe) {
+            Ok(md) if md.file_type().is_symlink() => {
+                return Err(
+                    FinalError::with_title("refusing to traverse on-disk symlink during extraction")
+                        .detail(format!("path: {}", PathFmt(&probe)))
+                        .into(),
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// LZMA/XZ dictionary memory cap (256 MiB). Bounds malformed-stream allocations
+pub const LZMA_MEMLIMIT_BYTES: u32 = 256 * 1024 * 1024;
+
+pub fn max_decompressed_bytes() -> u64 {
+    env::var("OUCH_MAX_DECOMPRESSED_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+pub struct LimitedReader<R> {
+    inner: R,
+    remaining: u64,
+}
+
+impl<R: Read> LimitedReader<R> {
+    pub fn new(inner: R) -> Self {
+        Self {
+            inner,
+            remaining: max_decompressed_bytes(),
+        }
+    }
+}
+
+pub fn copy_limited_decompression<R: Read, W: Write>(reader: R, writer: &mut W) -> io::Result<u64> {
+    let mut limited = LimitedReader::new(reader);
+    io::copy(&mut limited, writer)
+}
+
+impl<R: Read> Read for LimitedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        if self.remaining == 0 {
+            // Probe one byte to tell exactly-at-limit (EOF) from over-limit; discarded on error.
+            let mut probe = [0u8; 1];
+            return match self.inner.read(&mut probe)? {
+                0 => Ok(0),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "decompression output exceeded configured limit (see OUCH_MAX_DECOMPRESSED_BYTES)",
+                )),
+            };
+        }
+
+        let bytes_to_ready = usize::try_from(self.remaining).unwrap_or(usize::MAX).min(buf.len());
+        let bytes_read = self.inner.read(&mut buf[..bytes_to_ready])?;
+
+        self.remaining = self.remaining.saturating_sub(bytes_read as u64);
+        Ok(bytes_read)
+    }
+}
+
+/// Strip setuid/setgid/sticky bits from an archive-supplied mode.
+pub fn sanitize_archive_mode(mode: u32) -> u32 {
+    mode & 0o0777
+}
+
+/// RAII guard that restores the process CWD on drop.
+pub struct CwdGuard(Option<PathBuf>);
+
+impl CwdGuard {
+    pub fn new(previous: PathBuf) -> Self {
+        Self(Some(previous))
+    }
+}
+
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = env::set_current_dir(&p);
+        }
+    }
+}
+
+pub fn ensure_parent_dir_exists(file_path: &Path) -> io::Result<()> {
+    if let Some(parent) = file_path.parent()
+        && !parent.fs_err_try_exists()?
+    {
+        fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
+
+/// Returns current directory, but before change the process' directory to the
+/// one that contains the file pointed to by `filename`.
+pub fn cd_into_same_dir_as(filename: &Path) -> Result<PathBuf> {
+    let previous_location = env::current_dir()?;
+
+    let parent = filename.parent().ok_or(Error::CompressingRootFolder)?;
+    env::set_current_dir(parent)?;
+
+    Ok(previous_location)
+}
+
+/// Check if a path refers to the same file as the output handle.
+pub fn is_same_file_as_output(path: &Path, output_handle: &Handle) -> bool {
+    if matches!(Handle::from_path(path), Ok(x) if &x == output_handle) {
+        return true;
+    }
+    false
+}
+
+/// Check if an IO error is caused by a broken symlink.
+///
+/// Returns `true` if the error is `NotFound` and the path is a symlink,
+/// indicating the symlink target doesn't exist.
+pub fn is_broken_symlink_error(error: &io::Error, path: &Path) -> bool {
+    error.kind() == io::ErrorKind::NotFound && path.is_symlink()
+}
+
+/// Try to detect the file extension by looking for known magic strings
+/// Source: <https://en.wikipedia.org/wiki/List_of_file_signatures>
+pub fn try_infer_format(path: &Path) -> Option<CompressionFormat> {
+    fn is_zip(buf: &[u8]) -> bool {
+        buf.len() >= 3
+            && buf[..=1] == [0x50, 0x4B]
+            && (buf[2..=3] == [0x3, 0x4] || buf[2..=3] == [0x5, 0x6] || buf[2..=3] == [0x7, 0x8])
+    }
+    fn is_tar(buf: &[u8]) -> bool {
+        buf.len() > 261 && buf[257..=261] == [0x75, 0x73, 0x74, 0x61, 0x72]
+    }
+    fn is_gz(buf: &[u8]) -> bool {
+        buf.starts_with(&[0x1F, 0x8B, 0x8])
+    }
+    fn is_bz2(buf: &[u8]) -> bool {
+        buf.starts_with(&[0x42, 0x5A, 0x68])
+    }
+    fn is_bz3(buf: &[u8]) -> bool {
+        buf.starts_with(b"BZ3v1")
+    }
+    fn is_lzma(buf: &[u8]) -> bool {
+        buf.len() >= 14 && buf[0] == 0x5d && (buf[12] == 0x00 || buf[12] == 0xff) && buf[13] == 0x00
+    }
+    fn is_xz(buf: &[u8]) -> bool {
+        buf.starts_with(&[0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00])
+    }
+    fn is_lzip(buf: &[u8]) -> bool {
+        buf.starts_with(&[0x4C, 0x5A, 0x49, 0x50])
+    }
+    fn is_lz4(buf: &[u8]) -> bool {
+        buf.starts_with(&[0x04, 0x22, 0x4D, 0x18])
+    }
+    fn is_sz(buf: &[u8]) -> bool {
+        buf.starts_with(&[0xFF, 0x06, 0x00, 0x00, 0x73, 0x4E, 0x61, 0x50, 0x70, 0x59])
+    }
+    fn is_zst(buf: &[u8]) -> bool {
+        buf.starts_with(&[0x28, 0xB5, 0x2F, 0xFD])
+    }
+    fn is_rar(buf: &[u8]) -> bool {
+        // ref https://www.rarlab.com/technote.htm#rarsign
+        // RAR 5.0 8 bytes length signature: 0x52 0x61 0x72 0x21 0x1A 0x07 0x01 0x00
+        // RAR 4.x 7 bytes length signature: 0x52 0x61 0x72 0x21 0x1A 0x07 0x00
+        buf.len() >= 7
+            && buf.starts_with(&[0x52, 0x61, 0x72, 0x21, 0x1A, 0x07])
+            && (buf[6] == 0x00 || (buf.len() >= 8 && buf[6..=7] == [0x01, 0x00]))
+    }
+    fn is_sevenz(buf: &[u8]) -> bool {
+        buf.starts_with(&[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C])
+    }
+
+    let buf = {
+        let mut buf = [0; 270];
+
+        // Error cause will be ignored, so use std::fs instead of fs_err
+        let result = std::fs::File::open(path).map(|mut file| file.read(&mut buf));
+
+        // In case of file open or read failure, could not infer a extension
+        if result.is_err() {
+            return None;
+        }
+        buf
+    };
+
+    if is_zip(&buf) {
+        Some(CompressionFormat::Zip)
+    } else if is_tar(&buf) {
+        Some(CompressionFormat::Tar)
+    } else if is_gz(&buf) {
+        Some(CompressionFormat::Gzip)
+    } else if is_bz2(&buf) {
+        Some(CompressionFormat::Bzip)
+    } else if is_bz3(&buf) {
+        Some(CompressionFormat::Bzip3)
+    } else if is_lzma(&buf) {
+        Some(CompressionFormat::Lzma)
+    } else if is_xz(&buf) {
+        Some(CompressionFormat::Xz)
+    } else if is_lzip(&buf) {
+        Some(CompressionFormat::Lzip)
+    } else if is_lz4(&buf) {
+        Some(CompressionFormat::Lz4)
+    } else if is_sz(&buf) {
+        Some(CompressionFormat::Snappy)
+    } else if is_zst(&buf) {
+        Some(CompressionFormat::Zstd)
+    } else if is_rar(&buf) {
+        Some(CompressionFormat::Rar)
+    } else if is_sevenz(&buf) {
+        Some(CompressionFormat::SevenZip)
+    } else {
+        None
+    }
+}
+
+#[inline]
+pub fn create_symlink(target: &Path, full_path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, full_path)?;
+
+    // FIXME: how to detect whether the destination is a folder or a regular file?
+    // regular file should use fs::symlink_file
+    // folder should use fs::symlink_dir
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(target, full_path)?;
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[inline]
+pub fn set_permission_mode(path: &Path, mode: u32) -> Result<()> {
+    use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+    fs::set_permissions(path, Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+#[inline]
+pub fn set_permission_mode(_path: &Path, _mode: u32) -> Result<()> {
+    Ok(())
+}
+
+/// Canonicalize a path.
+///
+/// On Windows, it strips the `\\?\` extended path prefix that fs::canonicalize
+/// adds that would break `strip_prefix` calls involving this path.
+pub fn canonicalize(path: impl AsRef<Path>) -> Result<PathBuf> {
+    let canonicalized = fs::canonicalize(path.as_ref())?;
+
+    Ok(if cfg!(windows) {
+        strip_path_ascii_prefix(Cow::Owned(canonicalized), r"\\?\").into_owned()
+    } else {
+        canonicalized
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumIs)]
+pub enum FileType {
+    Regular,
+    Directory,
+    Symlink,
+}
+
+pub fn read_file_type(path: impl AsRef<Path>) -> Result<FileType> {
+    use file_type_enum::FileType::*;
+
+    let path = path.as_ref();
+    match file_type_enum::FileType::symlink_read_at(path)? {
+        Regular => Ok(FileType::Regular),
+        Directory => Ok(FileType::Directory),
+        Symlink => Ok(FileType::Symlink),
+        variant => Err(FinalError::with_title(format!("unsupported file type {variant}"))
+            .detail(format!("found at {}", PathFmt(path)))
+            .into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_path_stdin_recognizes_dash() {
+        assert!(is_path_stdin(Path::new("-")));
+    }
+
+    #[test]
+    fn is_path_stdin_rejects_normal_paths() {
+        assert!(!is_path_stdin(Path::new("file.txt")));
+        assert!(!is_path_stdin(Path::new("./-")));
+        assert!(!is_path_stdin(Path::new("--")));
+        assert!(!is_path_stdin(Path::new("")));
+    }
+
+    #[test]
+    fn try_infer_format_recognizes_zip_magic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.zip");
+        // Minimal ZIP local file header magic
+        std::fs::write(&path, b"PK\x03\x04rest").unwrap();
+        assert_eq!(try_infer_format(&path), Some(CompressionFormat::Zip));
+    }
+
+    #[test]
+    fn try_infer_format_recognizes_gzip_magic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.gz");
+        std::fs::write(&path, b"\x1f\x8b\x08\x00rest").unwrap();
+        assert_eq!(try_infer_format(&path), Some(CompressionFormat::Gzip));
+    }
+
+    #[test]
+    fn try_infer_format_returns_none_on_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.bin");
+        std::fs::write(&path, b"random bytes here").unwrap();
+        assert_eq!(try_infer_format(&path), None);
+    }
+
+    #[test]
+    fn try_infer_format_returns_none_on_missing_file() {
+        assert_eq!(try_infer_format(Path::new("/nonexistent/path/to/nothing")), None);
+    }
+}

@@ -1,0 +1,323 @@
+use std::{
+    borrow::Cow,
+    cmp,
+    ffi::{OsStr, OsString},
+    fmt::{self, Write as _},
+    path::{Path, PathBuf},
+};
+
+use crate::INITIAL_CURRENT_DIR;
+
+/// Converts an OsStr to utf8 with custom formatting.
+///
+/// This is different from [`Path::display`].
+///
+/// See <https://gist.github.com/marcospb19/ebce5572be26397cf08bbd0fd3b65ac1> for a comparison.
+pub fn path_to_str(path: &Path) -> Cow<'_, str> {
+    os_str_to_str(path.as_ref())
+}
+
+pub fn os_str_to_str(os_str: &OsStr) -> Cow<'_, str> {
+    let format = || {
+        let text = format!("{os_str:?}");
+        Cow::Owned(text.trim_matches('"').to_string())
+    };
+
+    os_str.to_str().map_or_else(format, Cow::Borrowed)
+}
+
+/// Removes the current dir from the beginning of a path as it's redundant information,
+/// useful for presentation sake.
+pub fn strip_cur_dir(source_path: &Path) -> &Path {
+    source_path.strip_prefix(&*INITIAL_CURRENT_DIR).unwrap_or(source_path)
+}
+
+/// Converts a slice of `AsRef<OsStr>` to comma separated String
+///
+/// Panics if the slice is empty.
+pub fn pretty_format_list_of_paths(paths: &[impl AsRef<Path>]) -> String {
+    let mut string = String::new();
+    for (i, path) in paths.iter().enumerate() {
+        if i != 0 {
+            string += ", ";
+        }
+        write!(string, "{}", PathFmt(path.as_ref())).expect("Couldn't write to a string");
+    }
+    string
+}
+
+/// Display the directory name, but use "current directory" when necessary.
+pub fn nice_directory_display(path: &Path) -> Cow<'_, str> {
+    if path == Path::new(".") {
+        Cow::Borrowed("current directory")
+    } else {
+        path_to_str(path)
+    }
+}
+
+/// Strips an ascii prefix from the path (similar to `<&str>::strip_prefix`).
+///
+/// # Panics:
+///
+/// - Panics if prefix is not valid ASCII (to ensure safety).
+pub fn strip_path_ascii_prefix<'a>(path: Cow<'a, Path>, ascii_prefix: &str) -> Cow<'a, Path> {
+    assert!(ascii_prefix.is_ascii());
+    let prefix_slice = ascii_prefix.as_bytes();
+    let path_slice = path.as_os_str().as_encoded_bytes();
+
+    if let Some(stripped) = path_slice.strip_prefix(prefix_slice) {
+        // Encoding Safety:
+        //   this function returns a format that is guaranteed to be a superset
+        //   of UTF-8, it might be WTF-8 encoding surrogates in UTF-8-like ways,
+        //   it's impossible for us to break surrogate pairs or character
+        //   boundaries if we slice an ASCII prefix, ASCII characters in WTF-8
+        //   and UTF-8 look exactly just like in plain ASCII encoding
+        let str = unsafe { OsStr::from_encoded_bytes_unchecked(stripped) };
+        Cow::from(PathBuf::from(str))
+    } else {
+        path
+    }
+}
+
+/// Append an ASCII suffix to an OS string.
+///
+/// # Panics:
+///
+/// - Panics if suffix is not valid ASCII (to ensure safety).
+pub fn append_ascii_suffix_to_os_str(os_str: &OsStr, ascii_suffix: &str) -> OsString {
+    assert!(ascii_suffix.is_ascii());
+
+    let mut bytes = os_str.as_encoded_bytes().to_vec();
+    bytes.extend_from_slice(ascii_suffix.as_bytes());
+
+    // Safety: appending ASCII bytes to a valid OsStr encoding preserves validity.
+    // ASCII characters in WTF-8/UTF-8 are encoded identically to plain ASCII,
+    // so appending them cannot create invalid sequences or break encoding.
+    unsafe { OsStr::from_encoded_bytes_unchecked(&bytes) }.to_owned()
+}
+
+pub struct PathFmt<'a>(pub &'a Path);
+pub struct NoQuotePathFmt<'a>(pub &'a Path);
+
+/// Returns true for bytes/chars that must be stripped before hitting a terminal
+/// Covers C0 controls, DEL, C1 controls (U+0080..U+009F), line/paragraph separators,
+/// BiDi formatting characters (Trojan Source, CVE-2021-42574), and zero-width
+/// / invisible characters used for homoglyph or hidden-content attacks
+pub fn is_unsafe_display_char(ch: char) -> bool {
+    match ch {
+        c if c.is_control() => true,
+        '\u{2028}' | '\u{2029}' => true,
+        '\u{202A}'..='\u{202E}' => true,
+        '\u{2066}'..='\u{2069}' => true,
+        '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}' | '\u{00AD}' | '\u{180E}' | '\u{034F}' | '\u{061C}' => true,
+        _ => false,
+    }
+}
+
+pub fn contains_unsafe_display_char(text: &str) -> bool {
+    text.chars().any(is_unsafe_display_char)
+}
+
+pub fn sanitize_for_display(text: &str) -> Cow<'_, str> {
+    if !contains_unsafe_display_char(text) {
+        return Cow::Borrowed(text);
+    }
+
+    let mut sanitized = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if is_unsafe_display_char(ch) {
+            sanitized.push('\u{FFFD}');
+        } else {
+            sanitized.push(ch);
+        }
+    }
+    Cow::Owned(sanitized)
+}
+
+/// Same as NoQuotePathFmt, but surrounded by "".
+impl<'a> fmt::Display for PathFmt<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "\"{}\"", NoQuotePathFmt(self.0))
+    }
+}
+
+/// Same as `path.display()` but try to strip some common noise prefixes
+/// Also strips control bytes and BiDi/zero-width chars to prevent terminal injection
+impl<'a> fmt::Display for NoQuotePathFmt<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let path = self.0;
+        debug_assert_ne!(path.as_os_str().as_encoded_bytes().len(), 0, "empty path");
+
+        let path = strip_path_ascii_prefix(Cow::Borrowed(path), "./");
+        let path = path.as_ref();
+
+        let path = path.strip_prefix(&*INITIAL_CURRENT_DIR).unwrap_or(path);
+        let path = if path.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            path
+        };
+
+        f.write_str(&sanitize_for_display(&path.display().to_string()))
+    }
+}
+
+/// Pretty `fmt::Display` impl for printing bytes as kB, MB, GB, etc.
+pub struct BytesFmt(pub u64);
+
+impl BytesFmt {
+    const UNIT_PREFIXES: [&'static str; 6] = ["", "ki", "Mi", "Gi", "Ti", "Pi"];
+}
+
+impl fmt::Display for BytesFmt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let num = self.0 as f64;
+
+        debug_assert!(num >= 0.0);
+        if num < 1_f64 {
+            return write!(f, "{num:>6.2}   B");
+        }
+
+        let delimiter = 1000_f64;
+        let exponent = cmp::min((num.ln() / 6.90775).floor() as i32, 4);
+
+        write!(
+            f,
+            "{:>6.2} {:>2}B",
+            num / delimiter.powi(exponent),
+            Self::UNIT_PREFIXES[exponent as usize],
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pretty_bytes_formatting() {
+        fn format_bytes(bytes: u64) -> String {
+            format!("{}", BytesFmt(bytes))
+        }
+        let b = 1;
+        let kb = b * 1000;
+        let mb = kb * 1000;
+        let gb = mb * 1000;
+
+        assert_eq!("  0.00   B", format_bytes(0)); // This is weird
+        assert_eq!("  1.00   B", format_bytes(b));
+        assert_eq!("999.00   B", format_bytes(b * 999));
+        assert_eq!(" 12.00 MiB", format_bytes(mb * 12));
+        assert_eq!("123.00 MiB", format_bytes(mb * 123));
+        assert_eq!("  5.50 MiB", format_bytes(mb * 5 + kb * 500));
+        assert_eq!("  7.54 GiB", format_bytes(gb * 7 + 540 * mb));
+        assert_eq!("  1.20 TiB", format_bytes(gb * 1200));
+
+        // bytes
+        assert_eq!("234.00   B", format_bytes(234));
+        assert_eq!("999.00   B", format_bytes(999));
+        // kilobytes
+        assert_eq!("  2.23 kiB", format_bytes(2234));
+        assert_eq!(" 62.50 kiB", format_bytes(62500));
+        assert_eq!("329.99 kiB", format_bytes(329990));
+        // megabytes
+        assert_eq!("  2.75 MiB", format_bytes(2750000));
+        assert_eq!(" 55.00 MiB", format_bytes(55000000));
+        assert_eq!("987.65 MiB", format_bytes(987654321));
+        // gigabytes
+        assert_eq!("  5.28 GiB", format_bytes(5280000000));
+        assert_eq!(" 95.20 GiB", format_bytes(95200000000));
+        assert_eq!("302.00 GiB", format_bytes(302000000000));
+        assert_eq!("302.99 GiB", format_bytes(302990000000));
+        // Weird aproximation cases:
+        assert_eq!("999.90 GiB", format_bytes(999900000000));
+        assert_eq!("  1.00 TiB", format_bytes(999990000000));
+    }
+
+    #[test]
+    fn strip_path_ascii_prefix_removes_prefix() {
+        let p = PathBuf::from("./foo/bar");
+        let stripped = strip_path_ascii_prefix(Cow::Borrowed(&p), "./");
+        assert_eq!(stripped.as_ref(), Path::new("foo/bar"));
+    }
+
+    #[test]
+    fn strip_path_ascii_prefix_no_match_returns_unchanged() {
+        let p = PathBuf::from("foo/bar");
+        let stripped = strip_path_ascii_prefix(Cow::Borrowed(&p), "./");
+        assert_eq!(stripped.as_ref(), Path::new("foo/bar"));
+    }
+
+    #[test]
+    fn strip_path_ascii_prefix_empty_prefix_is_noop() {
+        let p = PathBuf::from("foo/bar");
+        let stripped = strip_path_ascii_prefix(Cow::Borrowed(&p), "");
+        assert_eq!(stripped.as_ref(), Path::new("foo/bar"));
+    }
+
+    #[test]
+    fn append_ascii_suffix_appends_to_filename() {
+        let result = append_ascii_suffix_to_os_str(OsStr::new("file"), ".bak");
+        assert_eq!(result, OsString::from("file.bak"));
+    }
+
+    #[test]
+    fn append_ascii_suffix_appends_to_empty_str() {
+        let result = append_ascii_suffix_to_os_str(OsStr::new(""), "foo");
+        assert_eq!(result, OsString::from("foo"));
+    }
+
+    #[test]
+    fn nice_directory_display_dot_returns_phrase() {
+        assert_eq!(nice_directory_display(Path::new(".")), "current directory");
+    }
+
+    #[test]
+    fn nice_directory_display_other_returns_path() {
+        assert_eq!(nice_directory_display(Path::new("foo/bar")), "foo/bar");
+    }
+
+    #[test]
+    fn pretty_format_list_of_paths_single() {
+        let paths = [PathBuf::from("a.txt")];
+        assert_eq!(pretty_format_list_of_paths(&paths), "\"a.txt\"");
+    }
+
+    #[test]
+    fn pretty_format_list_of_paths_multiple() {
+        let paths = [PathBuf::from("a.txt"), PathBuf::from("b.txt"), PathBuf::from("c.txt")];
+        assert_eq!(pretty_format_list_of_paths(&paths), "\"a.txt\", \"b.txt\", \"c.txt\"");
+    }
+
+    #[test]
+    fn pretty_format_list_of_paths_empty() {
+        let paths: [PathBuf; 0] = [];
+        assert_eq!(pretty_format_list_of_paths(&paths), "");
+    }
+
+    #[test]
+    fn path_to_str_valid_utf8() {
+        assert_eq!(path_to_str(Path::new("foo/bar.txt")), "foo/bar.txt");
+    }
+
+    #[test]
+    fn os_str_to_str_valid_utf8() {
+        assert_eq!(os_str_to_str(OsStr::new("hello")), "hello");
+    }
+
+    #[test]
+    fn path_fmt_quotes_path() {
+        let p = Path::new("name.txt");
+        let rendered = format!("{}", PathFmt(p));
+        assert!(rendered.starts_with('"') && rendered.ends_with('"'));
+        assert!(rendered.contains("name.txt"));
+    }
+
+    #[test]
+    fn no_quote_path_fmt_does_not_quote() {
+        let p = Path::new("name.txt");
+        let rendered = format!("{}", NoQuotePathFmt(p));
+        assert!(!rendered.starts_with('"'));
+        assert!(rendered.contains("name.txt"));
+    }
+}

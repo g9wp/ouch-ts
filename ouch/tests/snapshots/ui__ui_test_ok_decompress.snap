@@ -1,0 +1,7 @@
+---
+source: tests/ui.rs
+expression: "run_ouch(\"ouch decompress output.zst\", dir)"
+---
+[INFO] File "output.zst" decompressed to "output/output"
+[INFO] Input file size: [SIZE]
+[INFO] Output file size: [SIZE]
