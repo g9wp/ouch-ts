@@ -102,6 +102,71 @@ export function fromFile(
   };
 }
 
+/**
+ * A synchronous random-access byte sink. Zip/7z encoders require a `Seek`
+ * output, so streaming compression for those formats writes into a host-side
+ * sink (a Deno/Node file) instead of wasm memory; see [`fileSink`].
+ */
+export interface SeekableSink {
+  /** Total bytes written so far. */
+  size: number;
+  /** Write `bytes` at `offset`, returning the new end offset. */
+  writeAt(offset: number, bytes: Uint8Array): number;
+  /** Read up to `length` bytes starting at `offset` (for streaming the result back). */
+  readAt(offset: number, length: number): Uint8Array;
+}
+
+/**
+ * A seekable sink over a Deno file (created/truncated), kept open until
+ * `close()` is called. Enables streaming zip/7z compression with bounded
+ * memory: the archive is written to disk, then streamed back in chunks.
+ */
+export function fileSink(path: string | URL): SeekableSink & { close(): void } {
+  const deno = (globalThis as unknown as {
+    Deno?: {
+      openSync(
+        p: string | URL,
+        opts: { read: true; write: true; create: true; truncate: true },
+      ): {
+        statSync(): { size: number };
+        seekSync(offset: number, mode: number): number;
+        readSync(buf: Uint8Array): number | null;
+        writeSync(bytes: Uint8Array): number;
+        close(): void;
+      };
+    };
+  }).Deno;
+  if (!deno) {
+    throw new Error("fileSink is only available in Deno");
+  }
+  const file = deno.openSync(path, {
+    read: true,
+    write: true,
+    create: true,
+    truncate: true,
+  });
+  return {
+    get size() {
+      return file.statSync().size;
+    },
+    writeAt(offset, bytes) {
+      // Deno.SeekMode.Start === 0
+      file.seekSync(offset, 0);
+      file.writeSync(bytes);
+      return offset + bytes.length;
+    },
+    readAt(offset, length) {
+      file.seekSync(offset, 0);
+      const buf = new Uint8Array(length);
+      const n = file.readSync(buf);
+      return n === null ? new Uint8Array(0) : buf.slice(0, n);
+    },
+    close() {
+      file.close();
+    },
+  };
+}
+
 export interface CompressOptions {
   /** Paths (in the virtual filesystem) to compress. */
   files: string[];
@@ -413,11 +478,12 @@ export class Ouch {
 
   /**
    * Stream-compress JS-owned files into `writable`. Input bytes are pulled
-   * from each file's source and output chunks are pushed to `writable` in
-   * bounded 256 KiB chunks, so neither the inputs nor the archive ever
-   * materialize in wasm memory. Supports `tar` (including chains like
-   * `tar.gz` / `tar.xz` / `tar.br`) and the single-stream formats; `zip`,
-   * `7z` and `bz2` need the buffered VFS flow ([`Ouch#compress`]).
+   * from each file's source in bounded chunks. `tar` (including chains like
+   * `tar.gz` / `tar.xz` / `tar.br`) and the single-stream formats push output
+   * chunks directly to `writable`; `zip`/`7z` write into `options.sink` (a
+   * host-side seekable file, see [`fileSink`]) because their encoders need a
+   * seekable output, then stream the file back in chunks — wasm memory stays
+   * bounded either way. `bz2` needs the buffered VFS flow ([`Ouch#compress`]).
    */
   async compressTo(
     files: CompressFile[],
@@ -427,6 +493,8 @@ export class Ouch {
       format?: string;
       level?: number;
       password?: string;
+      /** Required for zip/7z: a seekable file sink. */
+      sink?: SeekableSink;
     },
   ): Promise<CompressResult> {
     const args = new CompressFromArgs(options.output);
@@ -444,6 +512,36 @@ export class Ouch {
       return a;
     });
     const wasm = this.#wasm;
+
+    const fmt = (options.format ?? lastSegment(options.output)).toLowerCase();
+    if (fmt === "zip" || fmt === "7z") {
+      if (!options.sink) {
+        throw new Error(
+          `${fmt} streaming compression needs a seekable sink (Deno/Node file); pass options.sink = fileSink(path)`,
+        );
+      }
+      // Encode into the file, then stream it back in bounded chunks (this
+      // path has real backpressure since the read-back loop is async).
+      const result = wasm.compress_to_sink(
+        fileArgs,
+        args,
+        writeAtOf(options.sink),
+      ) as CompressResult;
+      const writer = writable.getWriter();
+      try {
+        let offset = 0;
+        while (offset < result.output_size) {
+          const chunk = options.sink.readAt(offset, STREAM_CHUNK);
+          if (chunk.length === 0) break;
+          await writer.write(chunk);
+          offset += chunk.length;
+        }
+      } finally {
+        writer.releaseLock();
+      }
+      return result;
+    }
+
     let result!: CompressResult;
     const readable = new ReadableStream<Uint8Array>({
       start: (controller) => {
@@ -640,6 +738,20 @@ function readAtOf(
 ): (offset: number, length: number) => Uint8Array {
   return (offset, length) => source.readAt(offset, length);
 }
+
+function writeAtOf(
+  sink: SeekableSink,
+): (offset: number, bytes: Uint8Array) => number {
+  return (offset, bytes) => sink.writeAt(offset, bytes);
+}
+
+function lastSegment(path: string): string {
+  const i = path.lastIndexOf(".");
+  return i < 0 ? path : path.slice(i + 1);
+}
+
+/** Same as the wasm chunk size: 256 KiB. */
+const STREAM_CHUNK = 256 * 1024;
 
 // ---------------------------------------------------------------------------
 // Module-level convenience helpers

@@ -1,5 +1,12 @@
 import { assert, assertEquals, assertRejects } from "@std/assert";
-import { fromBytes, fromFile, init, type SeekableSource, walk } from "./mod.ts";
+import {
+  fileSink,
+  fromBytes,
+  fromFile,
+  init,
+  type SeekableSource,
+  walk,
+} from "./mod.ts";
 
 function bytes(text: string): Uint8Array {
   return new TextEncoder().encode(text);
@@ -659,6 +666,107 @@ Deno.test("compressTo rejects formats that need a buffered encoder", async () =>
         }),
       Error,
     );
+  }
+});
+
+Deno.test("compressTo writes zip through a file sink", async () => {
+  const ouch = await init();
+  ouch.clear();
+
+  const a = bytes("zip via file sink");
+  const b = noise(256 * 1024);
+  const tmp = await Deno.makeTempFile({ suffix: ".zip" });
+  try {
+    const sink = fileSink(tmp);
+    try {
+      const chunks: Uint8Array[] = [];
+      const result = await ouch.compressTo(
+        [
+          { path: "a.txt", source: fromBytes(a) },
+          { path: "b.bin", source: fromBytes(b) },
+        ],
+        collectWritable(chunks),
+        { output: "out.zip", sink },
+      );
+      assertEquals(result.entries, 2);
+      assertEquals(
+        result.output_size,
+        chunks.reduce((n, c) => n + c.length, 0),
+      );
+
+      ouch.writeFile("out.zip", joinChunks(chunks));
+      const unpacked = ouch.decompress({ files: ["out.zip"], outputDir: "x" });
+      assertEquals(unpacked.files_unpacked, 2);
+      assertEquals(ouch.readFile("x/a.txt"), a);
+      assertEquals(ouch.readFile("x/b.bin"), b);
+    } finally {
+      sink.close();
+    }
+  } finally {
+    await Deno.remove(tmp);
+  }
+});
+
+Deno.test("compressTo writes 7z through a file sink", async () => {
+  const ouch = await init();
+  ouch.clear();
+
+  const payload = bytes("seven via file sink");
+  const tmp = await Deno.makeTempFile({ suffix: ".7z" });
+  try {
+    const sink = fileSink(tmp);
+    try {
+      const chunks: Uint8Array[] = [];
+      const result = await ouch.compressTo(
+        [{ path: "doc.txt", source: fromBytes(payload) }],
+        collectWritable(chunks),
+        { output: "out.7z", sink },
+      );
+      assertEquals(result.entries, 1);
+
+      ouch.writeFile("out.7z", joinChunks(chunks));
+      const unpacked = ouch.decompress({ files: ["out.7z"], outputDir: "x" });
+      assertEquals(unpacked.files_unpacked, 1);
+      assertEquals(ouch.readFile("x/doc.txt"), payload);
+    } finally {
+      sink.close();
+    }
+  } finally {
+    await Deno.remove(tmp);
+  }
+});
+
+Deno.test("compressTo zip via file sink with encryption", async () => {
+  const ouch = await init();
+  ouch.clear();
+
+  const payload = bytes("secret zip via sink");
+  const tmp = await Deno.makeTempFile({ suffix: ".zip" });
+  try {
+    const sink = fileSink(tmp);
+    try {
+      const chunks: Uint8Array[] = [];
+      await ouch.compressTo(
+        [{ path: "s.txt", source: fromBytes(payload) }],
+        collectWritable(chunks),
+        { output: "out.zip", password: "pw", sink },
+      );
+      ouch.writeFile("out.zip", joinChunks(chunks));
+      assertThrows(() =>
+        ouch.decompress({ files: ["out.zip"], outputDir: "x" })
+      );
+      const unpacked = ouch.decompress({
+        files: ["out.zip"],
+        password: "pw",
+        outputDir: "x",
+      });
+      assertEquals(unpacked.files_unpacked, 1);
+      assertEquals(ouch.readFile("x/s.txt"), payload);
+    } finally {
+      sink.close();
+    }
+  } finally {
+    await Deno.remove(tmp);
   }
 });
 

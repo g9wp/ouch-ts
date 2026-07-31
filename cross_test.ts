@@ -6,7 +6,7 @@
 // runs anywhere (local dev box, CI) with whatever tools are present.
 
 import { assertEquals } from "@std/assert";
-import { fromBytes, init, type Ouch } from "./mod.ts";
+import { fileSink, fromBytes, init, type Ouch } from "./mod.ts";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -684,5 +684,45 @@ Deno.test({
         ]),
       );
     });
+  },
+});
+
+Deno.test({
+  name: "cross: compressTo zip via file sink -> unzip",
+  ignore: !TOOL.unzip,
+  async fn() {
+    const ouch = await init();
+    ouch.clear();
+    const tmp = await Deno.makeTempFile({ suffix: ".zip" });
+    try {
+      const sink = fileSink(tmp);
+      try {
+        const chunks: Uint8Array[] = [];
+        await ouch.compressTo(
+          [
+            { path: "a.txt", source: fromBytes(bytes(PAYLOAD)) },
+            { path: "sub/b.txt", source: fromBytes(bytes("nested from sink")) },
+          ],
+          new WritableStream<Uint8Array>({
+            write: (c: Uint8Array) => {
+              chunks.push(c);
+            },
+          }),
+          { output: "out.zip", sink },
+        );
+        await withTempDir(async (dir) => {
+          await Deno.writeFile(`${dir}/out.zip`, joinChunks(chunks));
+          const integrity = run("unzip", ["-t", "out.zip"], dir);
+          assertEquals(integrity.code, 0, integrity.stderr);
+          const res = run("unzip", ["-p", "out.zip", "a.txt"], dir);
+          assertEquals(res.code, 0, res.stderr);
+          assertEquals(text(res.stdout), PAYLOAD);
+        });
+      } finally {
+        sink.close();
+      }
+    } finally {
+      await Deno.remove(tmp);
+    }
   },
 });

@@ -200,6 +200,33 @@ impl OuchWasm {
         run_stream_entry(&args, on_chunk).map_err(js_error)
     }
 
+    /// Stream-compress JS-owned files into a host-side seekable sink (a
+    /// Deno/Node file) for formats whose encoders need a seekable output
+    /// (zip, 7z): the archive is written to the file and never buffered in
+    /// wasm memory. The host reads the file back in chunks afterwards.
+    pub fn compress_to_sink(
+        files: Vec<CompressFileArgs>,
+        args: CompressFromArgs,
+        write_at: js_sys::Function,
+    ) -> Result<JsValue, JsError> {
+        run_compress_to_sink(&files, &args, write_at)
+            .map_err(js_error)
+            .and_then(|(output, output_size, entries)| {
+                let obj = js_sys::Object::new();
+                js_sys::Reflect::set(&obj, &JsValue::from_str("output"), &JsValue::from_str(&output))
+                    .map_err(|e| JsError::new(&format!("failed to build result: {e:?}")))?;
+                js_sys::Reflect::set(
+                    &obj,
+                    &JsValue::from_str("output_size"),
+                    &JsValue::from_f64(output_size as f64),
+                )
+                .map_err(|e| JsError::new(&format!("failed to build result: {e:?}")))?;
+                js_sys::Reflect::set(&obj, &JsValue::from_str("entries"), &JsValue::from_f64(entries as f64))
+                    .map_err(|e| JsError::new(&format!("failed to build result: {e:?}")))?;
+                Ok(obj.into())
+            })
+    }
+
     /// List the contents of an archive held by a JS-side random-access source
     /// (`read_at(offset, length) -> Uint8Array`, `size` bytes total). Only the
     /// metadata blocks are pulled from the host, so the whole archive never
@@ -804,6 +831,98 @@ fn io_err(e: std::io::Error) -> crate::Error {
     crate::Error::Custom {
         reason: FinalError::with_title("streaming compression failed").detail(format!("{e:?}")),
     }
+}
+
+/// Compress JS-owned files into a host-side seekable sink for formats whose
+/// encoders require `W: Write + Seek` (zip, 7z). The sink's bytes stay on the
+/// host (e.g. a Deno/Node file); wasm only holds input chunks and encoder
+/// state. The host streams the file back in chunks afterwards.
+fn run_compress_to_sink(
+    files: &[CompressFileArgs],
+    args: &CompressFromArgs,
+    write_at: js_sys::Function,
+) -> Result<(String, u64, usize)> {
+    use crate::wasm::seekable::JsSeekSink;
+
+    let formats = format_from_path_or_flag(&args.output, args.format.as_deref())?;
+    let (first, rest) = split_first_compression_format(&formats);
+    if files.is_empty() {
+        return Err(FinalError::with_title("no files to compress").into());
+    }
+    if !rest.is_empty() {
+        return Err(FinalError::with_title("wrapped zip/7z archives are not supported with a seekable sink").into());
+    }
+
+    let sink = JsSeekSink::new(write_at);
+    let sink_size = match first {
+        CompressionFormat::Zip => {
+            let mut writer = zip::ZipWriter::new(sink);
+            let base = zip::write::SimpleFileOptions::default()
+                .large_file(true)
+                .compression_level(args.level.map(i64::from));
+            for file in files {
+                let mut options = base;
+                if let Some(password) = args.password.as_deref() {
+                    options = options.with_aes_encryption(zip::AesMode::Aes256, password);
+                }
+                if file.is_dir {
+                    writer.add_directory(&file.name, options)?;
+                    continue;
+                }
+                writer.start_file(&file.name, options)?;
+                let mut reader =
+                    crate::wasm::seekable::JsSeekReader::new(file.read_at.clone(), file.size as u64);
+                std::io::copy(&mut reader, &mut writer)?;
+            }
+            writer.finish()?.size()
+        }
+        CompressionFormat::SevenZip => {
+            use sevenz_rust2::{
+                EncoderConfiguration, EncoderMethod,
+                encoder_options::{AesEncoderOptions, EncoderOptions, Lzma2Options},
+            };
+
+            let mut writer = sevenz_rust2::ArchiveWriter::new(sink)?;
+            let mut methods: Vec<EncoderConfiguration> = Vec::new();
+            if let Some(password) = args.password.as_deref() {
+                methods.push(AesEncoderOptions::new(sevenz_rust2::Password::from(password)).into());
+            }
+            let mut lzma2 = EncoderConfiguration::new(EncoderMethod::LZMA2);
+            if let Some(level) = args.level {
+                lzma2 = lzma2.with_options(EncoderOptions::Lzma2(
+                    Lzma2Options::from_level(level.clamp(0, 9) as u32),
+                ));
+            }
+            methods.push(lzma2);
+            writer.set_content_methods(methods);
+
+            for file in files {
+                if file.is_dir {
+                    writer.push_archive_entry::<std::io::Empty>(
+                        sevenz_rust2::ArchiveEntry::new_directory(&file.name),
+                        None,
+                    )?;
+                    continue;
+                }
+                let mut reader =
+                    crate::wasm::seekable::JsSeekReader::new(file.read_at.clone(), file.size as u64);
+                writer.push_archive_entry::<crate::wasm::seekable::JsSeekReader>(
+                    sevenz_rust2::ArchiveEntry::new_file(&file.name),
+                    Some(reader),
+                )?;
+            }
+            writer.finish()?.size()
+        }
+        other => {
+            return Err(FinalError::with_title(format!(
+                "a seekable sink is only needed for zip/7z; .{} streams directly (use compressTo)",
+                other.as_str()
+            ))
+            .into())
+        }
+    };
+
+    Ok((args.output.clone(), sink_size, files.len()))
 }
 
 fn run_decompress(args: &DecompressArgs) -> Result<(Vec<archives::Entry>, u64)> {
