@@ -413,6 +413,161 @@ pub fn build_7z(entries: &[Entry], level: Option<i16>, password: Option<&str>) -
 }
 
 // ---------------------------------------------------------------------------
+// rar
+// ---------------------------------------------------------------------------
+
+fn parse_rar(input: &[u8], password: Option<&[u8]>) -> Result<rars::Archive> {
+    let options = match password {
+        Some(password) => rars::ArchiveReadOptions::with_password(password),
+        None => rars::ArchiveReadOptions::new(),
+    };
+    rars::ArchiveReader::read_with_options(input, options).map_err(rar_err)
+}
+
+fn rar_err(err: rars::Error) -> crate::Error {
+    use rars::Error as RarError;
+    match err {
+        RarError::NeedPassword => crate::Error::InvalidPassword {
+            reason: "this rar archive needs a password".into(),
+        },
+        RarError::WrongPasswordOrCorruptData => crate::Error::InvalidPassword {
+            reason: "wrong password or corrupt rar archive".into(),
+        },
+        other => crate::Error::Custom {
+            reason: FinalError::with_title("failed to read rar archive").detail(format!("{other:?}")),
+        },
+    }
+}
+
+/// Convert a raw rar entry name (often backslash-separated, from Windows-host
+/// archives) into a safe `/`-separated VFS path.
+fn rar_name_to_path(name: &[u8]) -> Result<PathBuf> {
+    let normalized = String::from_utf8_lossy(name).replace('\\', "/");
+    validate_entry_path(Path::new(&normalized)).map_err(|_| unsafe_path_error(Path::new(&normalized)))
+}
+
+/// List the contents of an in-memory rar archive (metadata only).
+pub fn list_rar(input: &[u8], password: Option<&[u8]>) -> Result<Vec<Entry>> {
+    let archive = parse_rar(input, password)?;
+    archive
+        .members()
+        .map(|member| {
+            Ok(Entry {
+                path: rar_name_to_path(&member.meta.name)?,
+                size: member.meta.unpacked_size,
+                is_dir: member.meta.is_directory,
+                mode: 0o644,
+                ..Default::default()
+            })
+        })
+        .collect()
+}
+
+/// Unpack an in-memory rar archive into a list of entries (reads contents).
+pub fn unpack_rar(input: &[u8], password: Option<&[u8]>) -> Result<Vec<Entry>> {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[derive(Clone)]
+    struct Sink {
+        blobs: Rc<RefCell<Vec<Vec<u8>>>>,
+        index: usize,
+    }
+
+    impl Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.blobs.borrow_mut()[self.index].extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let archive = parse_rar(input, password)?;
+    let names = Rc::new(RefCell::new(Vec::<(Vec<u8>, bool)>::new()));
+    let blobs = Rc::new(RefCell::new(Vec::<Vec<u8>>::new()));
+
+    {
+        let names_ref = Rc::clone(&names);
+        let blobs_ref = Rc::clone(&blobs);
+        // The callback is infallible (path safety is checked afterwards); it
+        // records each member's raw name + a sink that rars streams into.
+        archive
+            .extract_to(password, |meta| {
+                let mut names = names_ref.borrow_mut();
+                let mut blobs = blobs_ref.borrow_mut();
+                names.push((meta.name.clone(), meta.is_directory));
+                blobs.push(Vec::new());
+                Ok(Box::new(Sink {
+                    blobs: Rc::clone(&blobs_ref),
+                    index: names.len() - 1,
+                }) as Box<dyn Write>)
+            })
+            .map_err(rar_err)?;
+    }
+
+    let names = Rc::try_unwrap(names).ok().unwrap().into_inner();
+    let blobs = Rc::try_unwrap(blobs).ok().unwrap().into_inner();
+
+    let mut entries = Vec::with_capacity(names.len());
+    for ((name, is_dir), blob) in names.iter().zip(blobs.iter()) {
+        let path = rar_name_to_path(name)?;
+        let mut entry = Entry {
+            path,
+            size: blob.len() as u64,
+            is_dir: *is_dir,
+            mode: 0o644,
+            ..Default::default()
+        };
+        if !*is_dir {
+            entry.data = blob.clone();
+        }
+        entries.push(entry);
+    }
+
+    add_implicit_dirs(&mut entries);
+    Ok(entries)
+}
+
+/// Read a single entry's contents from an in-memory rar archive (decodes the
+/// whole archive; rars exposes no random-access single-member reader).
+pub fn read_rar_entry(input: &[u8], password: Option<&[u8]>, entry_name: &str) -> Result<Vec<u8>> {
+    let entries = unpack_rar(input, password)?;
+    for entry in entries {
+        if !entry.is_dir && normalize_name(&entry.path) == entry_name {
+            return Ok(entry.data);
+        }
+    }
+    Err(entry_not_found(entry_name))
+}
+
+/// Synthesize entries for parent directories the archive did not list
+/// explicitly, so [`crate::wasm::entry`]'s writer creates them in the VFS.
+fn add_implicit_dirs(entries: &mut Vec<Entry>) {
+    let existing: std::collections::HashSet<PathBuf> = entries.iter().map(|e| e.path.clone()).collect();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for entry in entries.iter() {
+        let mut parent = entry.path.parent();
+        while let Some(p) = parent {
+            if !p.as_os_str().is_empty() && !existing.contains(p) && !dirs.contains(&p.to_path_buf()) {
+                dirs.push(p.to_path_buf());
+            }
+            parent = p.parent();
+        }
+    }
+    for dir in dirs {
+        entries.push(Entry {
+            path: dir,
+            is_dir: true,
+            mode: 0o755,
+            ..Default::default()
+        });
+    }
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+}
+
+// ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
 

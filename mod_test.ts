@@ -228,9 +228,56 @@ Deno.test("unsupported format errors cleanly", async () => {
   ouch.clear();
 
   ouch.writeFile("f.bin", bytes("x"));
-  assertThrows(() => ouch.compress({ files: ["f.bin"], output: "f.bz2" }));
+  assertThrows(() => ouch.compress({ files: ["f.bin"], output: "f.bz3" }));
   assertThrows(() => ouch.compress({ files: ["f.bin"], output: "f.zst" }));
   assertThrows(() => ouch.compress({ files: ["f.bin"], output: "f.rar" }));
+});
+
+Deno.test("bz2 roundtrip (banzai encoder + bzip2-rs decoder)", async () => {
+  const ouch = await init();
+  ouch.clear();
+
+  const content = bytes("hello bz2!");
+  ouch.writeFile("a.txt", content);
+  ouch.compress({ files: ["a.txt"], output: "a.txt.bz2" });
+
+  const listed = ouch.listArchive({ archives: ["a.txt.bz2"] });
+  assertEquals(listed.length, 1);
+
+  const result = ouch.decompress({ files: ["a.txt.bz2"] });
+  assertEquals(result.files_unpacked, 1);
+  assertEquals(text(ouch.readFile("a.txt")), "hello bz2!");
+});
+
+Deno.test("zst decompress (fixture created by the zstd CLI)", async () => {
+  const ouch = await init();
+  ouch.clear();
+
+  ouch.writeFile("sample.zst", await Deno.readFile("./fixtures/sample.zst"));
+
+  const result = ouch.decompress({ files: ["sample.zst"] });
+  assertEquals(result.files_unpacked, 1);
+  assertEquals(
+    text(ouch.readFile("sample")),
+    "the quick brown fox jumps over the lazy dog. ".repeat(4),
+  );
+});
+
+Deno.test("rar decompress (fixture created with the rars writer)", async () => {
+  const ouch = await init();
+  ouch.clear();
+
+  ouch.writeFile("sample.rar", await Deno.readFile("./fixtures/sample.rar"));
+
+  const listed = ouch.listArchive({ archives: ["sample.rar"] });
+  assertEquals(listed.map((e) => e.path), ["hello.txt"]);
+
+  const result = ouch.decompress({ files: ["sample.rar"], outputDir: "x" });
+  assertEquals(result.files_unpacked, 1);
+  assertEquals(
+    text(ouch.readFile("x/hello.txt")),
+    "the quick brown fox jumps over the lazy dog. ".repeat(8),
+  );
 });
 
 function assertThrows(fn: () => unknown): void {

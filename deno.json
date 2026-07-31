@@ -18,6 +18,7 @@
       "build.ts",
       "mod_test.ts",
       "cross_test.ts",
+      "fixtures/",
       "ouch/"
     ]
   }

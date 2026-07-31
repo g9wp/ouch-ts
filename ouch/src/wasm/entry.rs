@@ -33,10 +33,12 @@ impl OuchWasm {
 
     /// Formats available in this WASM build (pure-Rust codecs only).
     pub fn supported_formats() -> Vec<String> {
-        ["tar", "zip", "7z", "gz", "xz", "lzma", "lz", "lz4", "sz", "br"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect()
+        [
+            "tar", "zip", "7z", "gz", "xz", "lzma", "lz", "lz4", "sz", "br", "bz2", "zst", "rar",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
     }
 
     // ------------------------------------------------------------------
@@ -466,7 +468,9 @@ fn run_compress(args: &CompressArgs) -> Result<(String, u64, usize)> {
         CompressionFormat::Tar => archives::build_tar(&entries)?,
         CompressionFormat::Zip => archives::build_zip(&entries, args.level, args.password.as_deref())?,
         CompressionFormat::SevenZip => archives::build_7z(&entries, args.level, args.password.as_deref())?,
-        CompressionFormat::Rar => return Err(codecs::unavailable("rar")),
+        CompressionFormat::Rar => {
+            return Err(FinalError::with_title("compressing to rar is not supported").into())
+        }
         non_archive => {
             if entries.len() != 1 || entries[0].is_dir {
                 return Err(
@@ -499,7 +503,7 @@ fn run_decompress(args: &DecompressArgs) -> Result<(Vec<archives::Entry>, u64)> 
         // Where outputs land (mirrors ouch's default wrapper-dir behavior).
         let is_archive = matches!(
             first,
-            CompressionFormat::Tar | CompressionFormat::Zip | CompressionFormat::SevenZip
+            CompressionFormat::Tar | CompressionFormat::Zip | CompressionFormat::SevenZip | CompressionFormat::Rar
         );
         let output_root = match &args.output_dir {
             Some(dir) => PathBuf::from(dir),
@@ -525,7 +529,10 @@ fn run_decompress(args: &DecompressArgs) -> Result<(Vec<archives::Entry>, u64)> 
                 let entries = archives::unpack_7z(&decoded, password)?;
                 files_unpacked += write_entries(&output_root, &entries, args.overwrite, &mut outputs)? as u64;
             }
-            CompressionFormat::Rar => return Err(codecs::unavailable("rar")),
+            CompressionFormat::Rar => {
+                let entries = archives::unpack_rar(&decoded, password)?;
+                files_unpacked += write_entries(&output_root, &entries, args.overwrite, &mut outputs)? as u64;
+            }
             non_archive => {
                 // Decode the first (and only) non-archive layer.
                 let decoded = codecs::decode(non_archive, &decoded)?;
@@ -624,7 +631,11 @@ fn run_list(args: &ListArgs) -> Result<Vec<(String, archives::Entry)>> {
                     all.push((archive.clone(), entry));
                 }
             }
-            CompressionFormat::Rar => return Err(codecs::unavailable("rar")),
+            CompressionFormat::Rar => {
+                for entry in archives::list_rar(&decoded, password)? {
+                    all.push((archive.clone(), entry));
+                }
+            }
             non_archive => {
                 // Report the decoded size for non-archive formats.
                 let decoded = codecs::decode(non_archive, &decoded)?;
@@ -654,7 +665,7 @@ fn run_read_entry(args: &ReadEntryArgs) -> Result<Vec<u8>> {
         CompressionFormat::Tar => archives::read_tar_entry(&decoded, &entry_name),
         CompressionFormat::Zip => archives::read_zip_entry(&decoded, password, &entry_name),
         CompressionFormat::SevenZip => archives::read_7z_entry(&decoded, password, &entry_name),
-        CompressionFormat::Rar => Err(codecs::unavailable("rar")),
+        CompressionFormat::Rar => archives::read_rar_entry(&decoded, password, &entry_name),
         // A single non-archive file is its own only "entry".
         non_archive => codecs::decode(non_archive, &decoded),
     }

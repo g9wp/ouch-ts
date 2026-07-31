@@ -19,7 +19,8 @@ import initWasm, {
 // Types
 // ---------------------------------------------------------------------------
 
-/** Formats available in the WASM build (pure-Rust codecs only). */
+/** Formats available in the WASM build (pure-Rust codecs only).
+ * `zst` and `rar` are decompress-only. */
 export type OuchFormat =
   | "tar"
   | "zip"
@@ -30,7 +31,10 @@ export type OuchFormat =
   | "lz"
   | "lz4"
   | "sz"
-  | "br";
+  | "br"
+  | "bz2"
+  | "zst"
+  | "rar";
 
 export interface CompressOptions {
   /** Paths (in the virtual filesystem) to compress. */

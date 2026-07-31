@@ -30,12 +30,17 @@ const TOOL = {
   "7z": available("7z", ["i"]),
   brotli: available("brotli", ["--version"]),
   lz4: available("lz4", ["--version"]),
+  bzip2: available("bzip2", ["--version"]),
+  zstd: available("zstd", ["--version"]),
+  // `rar` prints its usage banner and exits non-zero with no arguments.
+  rar: available("rar", []),
 };
 
 function available(cmd: string, args: string[]): boolean {
   try {
-    return new Deno.Command(cmd, { args, stdout: "null", stderr: "null" })
-      .outputSync().success;
+    new Deno.Command(cmd, { args, stdout: "null", stderr: "null" })
+      .outputSync();
+    return true;
   } catch {
     return false;
   }
@@ -190,6 +195,7 @@ const OUCH_STREAM = [
   { name: "xz", ext: "xz", cmd: "xz", tool: "xz" },
   // `xz` also decodes the classic .lzma (lzma_alone) container.
   { name: "lzma", ext: "lzma", cmd: "xz", tool: "xz" },
+  { name: "bz2", ext: "bz2", cmd: "bzip2", tool: "bzip2" },
 ] as const;
 
 for (const { name, ext, cmd, tool } of OUCH_STREAM) {
@@ -425,6 +431,9 @@ const EXTERNAL_STREAM = [
     tool: "xz",
     args: ["--format=lzma", "-c"],
   },
+  { name: "bz2", ext: "bz2", cmd: "bzip2", tool: "bzip2", args: ["-c"] },
+  // ouch cannot encode zstd, so this direction is decode-only.
+  { name: "zst", ext: "zst", cmd: "zstd", tool: "zstd", args: ["-c"] },
 ] as const;
 
 for (const { name, ext, cmd, tool, args } of EXTERNAL_STREAM) {
@@ -560,6 +569,37 @@ Deno.test({
       });
       assertEquals(result.files_unpacked, 1);
       assertEquals(vfsFiles(ouch, "x"), new Map([["a.txt", PAYLOAD]]));
+    });
+  },
+});
+
+Deno.test({
+  name: "cross: rar -> ouch",
+  ignore: !TOOL.rar,
+  async fn() {
+    await withTempDir(async (tmp) => {
+      await Deno.writeFile(`${tmp}/a.txt`, bytes(PAYLOAD));
+      await Deno.mkdir(`${tmp}/sub`);
+      await Deno.writeFile(`${tmp}/sub/b.txt`, bytes("nested from rar"));
+      const made = run(
+        "rar",
+        ["a", "-y", "-idq", "out.rar", "a.txt", "sub/b.txt"],
+        tmp,
+      );
+      assertEquals(made.code, 0, made.stderr);
+
+      const ouch = await init();
+      ouch.clear();
+      ouch.writeFile("out.rar", await Deno.readFile(`${tmp}/out.rar`));
+      const result = ouch.decompress({ files: ["out.rar"], outputDir: "x" });
+      assertEquals(result.files_unpacked, 2);
+      assertEquals(
+        vfsFiles(ouch, "x"),
+        new Map([
+          ["a.txt", PAYLOAD],
+          ["sub/b.txt", "nested from rar"],
+        ]),
+      );
     });
   },
 });

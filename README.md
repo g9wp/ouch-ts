@@ -10,10 +10,12 @@ TS API (mod.ts)  ->  ouch wasm (rust)  ->  pure-Rust codecs (zip/tar/7z/gz/xz/..
 ## Supported formats
 
 `tar`, `zip`, `7z`, `gz`, `xz`, `lzma`, `lz`, `lz4`, `sz` (snappy), `br` (brotli),
-including chains like `tar.gz`.
+`bz2`, including chains like `tar.gz` and `tar.bz2`.
 
-Formats that need a C toolchain (`bz2`, `bz3`, `zst`, `rar`) are not available
-in the WASM build.
+- `zst` (zstd) and `rar` are **decompress-only** (no pure-Rust encoder for zstd;
+  rar is a read-only format by design).
+- `bz3` needs a C toolchain (`libbzip3`) and is not available in the WASM build;
+  the native CLI supports it.
 
 ## Building the wasm package
 
