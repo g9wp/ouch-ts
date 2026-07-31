@@ -71,6 +71,7 @@ const archive = ouch.readFile("docs.tar.gz");
 ├── deno.json       # deno tasks (build / test / check) + publish config
 ├── mod.ts          # TypeScript API
 ├── mod_test.ts     # end-to-end tests (run: deno test -A)
+├── cross_test.ts   # interop tests vs external tools (tar/zip/7z/...)
 ├── build.ts        # wasm-pack build script
 ├── pkg/            # generated: ouch.js + ouch_bg.wasm + ouch.d.ts
 └── ouch/           # the ouch rust repo (vendor)
