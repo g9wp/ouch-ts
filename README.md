@@ -134,13 +134,18 @@ authentication).
   entry in memory — prefer streaming for anything large.
 - **Random access via `SeekableSource`**: `listFrom` / `readEntryFrom` /
   `streamEntryFrom` keep the archive on the JS side (`fromBytes`, or
-  `fromFile` in Deno) and wasm pulls only the ranges it needs through a
-  synchronous `readAt(offset, length)` callback. Zip metadata (central
-  directory), tar headers and 7z headers are read by seeking, and a single
-  entry is decompressed by seeking to its data — the whole archive never
-  enters wasm memory. `tar.*` chains decode sequentially; wrapped
+  `fromFile`/`fileSink` in Deno and Node) and wasm pulls only the ranges it
+  needs through a synchronous `readAt(offset, length)` callback. Zip metadata
+  (central directory), tar headers and 7z headers are read by seeking, and a
+  single entry is decompressed by seeking to its data — the whole archive
+  never enters wasm memory. `tar.*` chains decode sequentially; wrapped
   zip/7z/rar and `rar` (no random-access reader) fall back to whole-source
   reads. Byte sizes are JS `number`s (exact up to 2^53).
+
+  `fromFile`/`fileSink` auto-detect the runtime: Deno's file API first, then
+  Node's `node:fs` via `process.getBuiltinModule` (Node ≥ 22.3); pass `node:fs`
+  (or a compatible `SyncFs`) explicitly on older Node / bundlers. Browsers
+  have no synchronous file API.
 - **Streaming compression**: `ouch.compressTo(files, writable, options)` (or
   the module-level `compressTo`) pulls each input file from its
   [`SeekableSource`] and pushes 256 KiB output chunks to `writable`, so
@@ -148,9 +153,9 @@ authentication).
   (including chains like `tar.gz` / `tar.xz` / `tar.br`) and the single-stream
   formats (gz/xz/lzma/lz/lz4/sz/br). `zip`/`7z` need a seekable output, so on
   Deno/Node pass `options.sink = fileSink(path)` and the archive is written to
-  a temp file and streamed back in chunks (bounded memory, real
-  backpressure); `bz2`'s pure-Rust encoder is one-shot, so it uses the
-  buffered VFS flow (`compress`) — `compressTo` rejects those with a hint.
+  a file and streamed back in chunks (bounded memory, real backpressure);
+  `bz2`'s pure-Rust encoder is one-shot, so it uses the buffered VFS flow
+  (`compress`) — `compressTo` rejects those with a hint.
 - `password` enables AES-256 encryption when compressing to zip/7z;
   encrypted archives need it to list, read or extract. `level` (0-9) applies
   to zip (deflate), 7z (LZMA2) and the streaming formats.

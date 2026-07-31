@@ -65,36 +65,21 @@ export function fromBytes(bytes: Uint8Array): SeekableSource {
 }
 
 /**
- * A seekable source over a Deno file, opened read-only and kept open until
- * `close()` is called. This gives true disk random access: listing a huge
- * archive only reads its header blocks. Not available in browsers (no sync
- * file API); pass `--allow-read` when running under Deno.
+ * A seekable source over a Deno/Node file, opened read-only and kept open
+ * until `close()` is called. Gives true disk random access: listing a huge
+ * archive only reads its header blocks. Deno is detected automatically; in
+ * Node, `node:fs` is picked up via `process.getBuiltinModule` (or pass `fs`
+ * explicitly on older versions / bundlers). Browsers have no sync file API.
  */
 export function fromFile(
   path: string | URL,
+  fs?: SyncFs,
 ): SeekableSource & { close(): void } {
-  const deno = (globalThis as unknown as {
-    Deno?: {
-      openSync(p: string | URL, opts: { read: true }): {
-        statSync(): { size: number };
-        seekSync(offset: number, mode: number): number;
-        readSync(buf: Uint8Array): number | null;
-        close(): void;
-      };
-    };
-  }).Deno;
-  if (!deno) {
-    throw new Error("fromFile is only available in Deno");
-  }
-  const file = deno.openSync(path, { read: true });
+  const file = openFile(path, fs, "r");
   return {
-    size: file.statSync().size,
+    size: file.statSize(),
     readAt(offset, length) {
-      // Deno.SeekMode.Start === 0
-      file.seekSync(offset, 0);
-      const buf = new Uint8Array(length);
-      const n = file.readSync(buf);
-      return n === null ? new Uint8Array(0) : buf.slice(0, n);
+      return file.readAt(offset, length);
     },
     close() {
       file.close();
@@ -117,52 +102,159 @@ export interface SeekableSink {
 }
 
 /**
- * A seekable sink over a Deno file (created/truncated), kept open until
+ * A seekable sink over a Deno/Node file (created/truncated), kept open until
  * `close()` is called. Enables streaming zip/7z compression with bounded
- * memory: the archive is written to disk, then streamed back in chunks.
+ * memory: the archive is written to disk, then streamed back in chunks. Deno
+ * is detected automatically; in Node, `node:fs` is picked up via
+ * `process.getBuiltinModule` (or pass `fs` explicitly on older versions).
  */
-export function fileSink(path: string | URL): SeekableSink & { close(): void } {
-  const deno = (globalThis as unknown as {
-    Deno?: {
-      openSync(
-        p: string | URL,
-        opts: { read: true; write: true; create: true; truncate: true },
-      ): {
-        statSync(): { size: number };
-        seekSync(offset: number, mode: number): number;
-        readSync(buf: Uint8Array): number | null;
-        writeSync(bytes: Uint8Array): number;
-        close(): void;
-      };
-    };
-  }).Deno;
-  if (!deno) {
-    throw new Error("fileSink is only available in Deno");
-  }
-  const file = deno.openSync(path, {
-    read: true,
-    write: true,
-    create: true,
-    truncate: true,
-  });
+export function fileSink(
+  path: string | URL,
+  fs?: SyncFs,
+): SeekableSink & { close(): void } {
+  const file = openFile(path, fs, "rw");
   return {
     get size() {
-      return file.statSync().size;
+      return file.statSize();
     },
     writeAt(offset, bytes) {
-      // Deno.SeekMode.Start === 0
-      file.seekSync(offset, 0);
-      file.writeSync(bytes);
-      return offset + bytes.length;
+      return file.writeAt(offset, bytes);
     },
     readAt(offset, length) {
+      return file.readAt(offset, length);
+    },
+    close() {
+      file.close();
+    },
+  };
+}
+
+/**
+ * The subset of the synchronous `node:fs` API used by [`fromFile`] /
+ * [`fileSink`]. Pass `node:fs` itself in Node, or a compatible shim.
+ */
+export interface SyncFs {
+  openSync(path: string | URL, flags: string): number;
+  fstatSync(fd: number): { size: number };
+  readSync(
+    fd: number,
+    buffer: Uint8Array,
+    offset: number,
+    length: number,
+    position: number,
+  ): number;
+  writeSync(
+    fd: number,
+    buffer: Uint8Array,
+    offset: number,
+    length: number,
+    position: number,
+  ): number;
+  closeSync(fd: number): void;
+}
+
+/** Common view over a Deno file handle or a Node file descriptor. */
+interface OpenFile {
+  statSize(): number;
+  readAt(offset: number, length: number): Uint8Array;
+  writeAt(offset: number, bytes: Uint8Array): number;
+  close(): void;
+}
+
+function openFile(
+  path: string | URL,
+  fs: SyncFs | undefined,
+  mode: "r" | "rw",
+): OpenFile {
+  const deno = (globalThis as unknown as { Deno?: unknown }).Deno;
+  if (deno) {
+    return openDenoFile(deno as DenoLike, path, mode);
+  }
+  const nfs = fs ?? nodeFs();
+  if (nfs) {
+    return openNodeFile(nfs, path, mode);
+  }
+  throw new Error(
+    "fromFile/fileSink need Deno or Node; pass a node:fs-like `fs` in other runtimes",
+  );
+}
+
+/** Node's `process.getBuiltinModule` (Node >= 22.3); undefined elsewhere. */
+function nodeFs(): SyncFs | undefined {
+  const getBuiltin = (globalThis as unknown as {
+    process?: { getBuiltinModule?: (name: string) => unknown };
+  }).process?.getBuiltinModule;
+  return getBuiltin?.("fs") as SyncFs | undefined;
+}
+
+interface DenoLike {
+  openSync(
+    path: string | URL,
+    opts: { read: true; write?: true; create?: true; truncate?: true },
+  ): {
+    statSync(): { size: number };
+    seekSync(offset: number, mode: number): number;
+    readSync(buf: Uint8Array): number | null;
+    writeSync(bytes: Uint8Array): number;
+    close(): void;
+  };
+}
+
+function openDenoFile(
+  deno: DenoLike,
+  path: string | URL,
+  mode: "r" | "rw",
+): OpenFile {
+  const file = deno.openSync(
+    path,
+    mode === "rw"
+      ? { read: true, write: true, create: true, truncate: true }
+      : { read: true },
+  );
+  return {
+    statSize() {
+      return file.statSync().size;
+    },
+    readAt(offset, length) {
+      // Deno.SeekMode.Start === 0
       file.seekSync(offset, 0);
       const buf = new Uint8Array(length);
       const n = file.readSync(buf);
       return n === null ? new Uint8Array(0) : buf.slice(0, n);
     },
+    writeAt(offset, bytes) {
+      file.seekSync(offset, 0);
+      file.writeSync(bytes);
+      return offset + bytes.length;
+    },
     close() {
       file.close();
+    },
+  };
+}
+
+/** Node: `readSync`/`writeSync` are position-based, so no explicit seek. */
+function openNodeFile(
+  fs: SyncFs,
+  path: string | URL,
+  mode: "r" | "rw",
+): OpenFile {
+  const fd = fs.openSync(path, mode === "rw" ? "w+" : "r");
+  return {
+    statSize() {
+      return fs.fstatSync(fd).size;
+    },
+    readAt(offset, length) {
+      const buf = new Uint8Array(length);
+      const n = fs.readSync(fd, buf, 0, length, offset);
+      return n <= 0 ? new Uint8Array(0) : buf.slice(0, n);
+    },
+    writeAt(offset, bytes) {
+      fs.writeSync(fd, bytes, 0, bytes.length, offset);
+      return offset + bytes.length;
+    },
+    close() {
+      fs.closeSync(fd);
     },
   };
 }

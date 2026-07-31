@@ -653,6 +653,53 @@ Deno.test("compressTo reads input from a disk file", async () => {
   }
 });
 
+Deno.test("fromFile / fileSink work through a node:fs backend", async () => {
+  // Exercises the Node position-based I/O path via Deno's node:fs shim.
+  const fs = await import("node:fs");
+  const ouch = await init();
+  ouch.clear();
+
+  const payload = bytes("node backend roundtrip");
+  const tmp = await Deno.makeTempFile();
+  try {
+    await Deno.writeFile(tmp, payload);
+    const src = fromFile(tmp, fs);
+    try {
+      assertEquals(src.size, payload.length);
+      assertEquals(text(src.readAt(5, 7)), "backend");
+    } finally {
+      src.close();
+    }
+
+    // fileSink via node:fs: zip streams through the sink.
+    const sinkPath = `${tmp}.zip`;
+    try {
+      const sink = fileSink(sinkPath, fs);
+      try {
+        const chunks: Uint8Array[] = [];
+        await ouch.compressTo(
+          [{ path: "n.txt", source: fromBytes(payload) }],
+          collectWritable(chunks),
+          { output: "out.zip", sink },
+        );
+        ouch.writeFile("out.zip", joinChunks(chunks));
+        const unpacked = ouch.decompress({
+          files: ["out.zip"],
+          outputDir: "x",
+        });
+        assertEquals(unpacked.files_unpacked, 1);
+        assertEquals(ouch.readFile("x/n.txt"), payload);
+      } finally {
+        sink.close();
+      }
+    } finally {
+      await Deno.remove(sinkPath);
+    }
+  } finally {
+    await Deno.remove(tmp);
+  }
+});
+
 Deno.test("compressTo rejects formats that need a buffered encoder", async () => {
   const ouch = await init();
   ouch.clear();
