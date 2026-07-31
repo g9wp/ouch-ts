@@ -9,6 +9,8 @@
 
 import initWasm, {
   CompressArgs,
+  CompressFileArgs,
+  CompressFromArgs,
   DecompressArgs,
   ListArgs,
   OuchWasm,
@@ -111,6 +113,21 @@ export interface CompressOptions {
   level?: number;
   /** AES-256 encrypt the archive (zip and 7z only). */
   password?: string;
+}
+
+/**
+ * One input file for streaming compression ([`Ouch#compressTo`]). The bytes
+ * are pulled from `source` in bounded chunks; `source.size` must be exact.
+ */
+export interface CompressFile {
+  /** Path inside the archive. */
+  path: string;
+  /** File content (a seekable source, e.g. [`fromBytes`] or [`fromFile`]). */
+  source: SeekableSource;
+  /** Unix permission bits (default `0o644`). */
+  mode?: number;
+  /** Write a directory entry instead of reading `source`. */
+  isDir?: boolean;
 }
 
 export interface DecompressOptions {
@@ -395,6 +412,64 @@ export class Ouch {
   }
 
   /**
+   * Stream-compress JS-owned files into `writable`. Input bytes are pulled
+   * from each file's source and output chunks are pushed to `writable` in
+   * bounded 256 KiB chunks, so neither the inputs nor the archive ever
+   * materialize in wasm memory. Supports `tar` (including chains like
+   * `tar.gz` / `tar.xz` / `tar.br`) and the single-stream formats; `zip`,
+   * `7z` and `bz2` need the buffered VFS flow ([`Ouch#compress`]).
+   */
+  async compressTo(
+    files: CompressFile[],
+    writable: WritableStream<Uint8Array>,
+    options: {
+      output: string;
+      format?: string;
+      level?: number;
+      password?: string;
+    },
+  ): Promise<CompressResult> {
+    const args = new CompressFromArgs(options.output);
+    if (options.format !== undefined) args.set_format(options.format);
+    if (options.level !== undefined) args.set_level(options.level);
+    if (options.password !== undefined) args.set_password(options.password);
+    const fileArgs = files.map((f) => {
+      const a = new CompressFileArgs(
+        f.path,
+        f.isDir ? 0 : f.source.size,
+        readAtOf(f.source),
+      );
+      a.set_mode(f.mode ?? 0o644);
+      if (f.isDir) a.set_dir(true);
+      return a;
+    });
+    const wasm = this.#wasm;
+    let result!: CompressResult;
+    const readable = new ReadableStream<Uint8Array>({
+      start: (controller) => {
+        try {
+          result = wasm.compress_from(fileArgs, args, (chunk: Uint8Array) => {
+            try {
+              controller.enqueue(chunk);
+            } catch {
+              // Consumer cancelled; wasm aborts on the next emit.
+            }
+          }) as CompressResult;
+          controller.close();
+        } catch (err) {
+          try {
+            controller.error(err);
+          } catch {
+            // Already cancelled.
+          }
+        }
+      },
+    });
+    await readable.pipeTo(writable);
+    return result;
+  }
+
+  /**
    * Stream one entry's contents out of an archive (or a single-file format)
    * in bounded chunks. The underlying wasm call runs synchronously once the
    * stream is constructed, pushing each chunk into the stream; `entry` is
@@ -588,6 +663,23 @@ export async function compress(
     w.releaseLock();
   }
   return result;
+}
+
+/**
+ * Stream-compress JS-owned files into `writable` in bounded chunks (see
+ * [`Ouch#compressTo`]).
+ */
+export async function compressTo(
+  files: CompressFile[],
+  writable: WritableStream<Uint8Array>,
+  options: {
+    output: string;
+    format?: string;
+    level?: number;
+    password?: string;
+  },
+): Promise<CompressResult> {
+  return (await init()).compressTo(files, writable, options);
 }
 
 /** List archive contents (metadata only). */

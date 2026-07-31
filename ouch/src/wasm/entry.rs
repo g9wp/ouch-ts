@@ -117,6 +117,35 @@ impl OuchWasm {
             })
     }
 
+    /// Stream-compress JS-owned files: input bytes are pulled from each file's
+    /// `read_at` callback and output chunks are pushed to `on_chunk`, so
+    /// neither side ever holds the whole archive in wasm memory. Supports tar
+    /// (with stream layers like `tar.gz`) and single-stream formats; zip/7z/
+    /// bz2 need the VFS flow (their encoders require seekable or buffered
+    /// output).
+    pub fn compress_from(
+        files: Vec<CompressFileArgs>,
+        args: CompressFromArgs,
+        on_chunk: js_sys::Function,
+    ) -> Result<JsValue, JsError> {
+        run_compress_from(&files, &args, on_chunk)
+            .map_err(js_error)
+            .and_then(|(output, output_size, entries)| {
+                let obj = js_sys::Object::new();
+                js_sys::Reflect::set(&obj, &JsValue::from_str("output"), &JsValue::from_str(&output))
+                    .map_err(|e| JsError::new(&format!("failed to build result: {e:?}")))?;
+                js_sys::Reflect::set(
+                    &obj,
+                    &JsValue::from_str("output_size"),
+                    &JsValue::from_f64(output_size as f64),
+                )
+                .map_err(|e| JsError::new(&format!("failed to build result: {e:?}")))?;
+                js_sys::Reflect::set(&obj, &JsValue::from_str("entries"), &JsValue::from_f64(entries as f64))
+                    .map_err(|e| JsError::new(&format!("failed to build result: {e:?}")))?;
+                Ok(obj.into())
+            })
+    }
+
     /// Decompress the given VFS files.
     ///
     /// Output files are written into the virtual filesystem; the result is
@@ -257,6 +286,82 @@ impl CompressArgs {
     /// Enable AES-256 encryption (zip and 7z only).
     pub fn set_password(&mut self, password: String) {
         self.password = Some(password);
+    }
+}
+
+/// Arguments for [`OuchWasm::compress_from`].
+#[wasm_bindgen]
+#[derive(Default)]
+pub struct CompressFromArgs {
+    #[wasm_bindgen(skip)]
+    pub output: String,
+    #[wasm_bindgen(skip)]
+    pub format: Option<String>,
+    #[wasm_bindgen(skip)]
+    pub level: Option<i16>,
+    #[wasm_bindgen(skip)]
+    pub password: Option<String>,
+}
+
+#[wasm_bindgen]
+impl CompressFromArgs {
+    #[wasm_bindgen(constructor)]
+    pub fn new(output: String) -> Self {
+        Self {
+            output,
+            ..Default::default()
+        }
+    }
+
+    pub fn set_format(&mut self, format: String) {
+        self.format = Some(format);
+    }
+
+    pub fn set_level(&mut self, level: i16) {
+        self.level = Some(level);
+    }
+
+    pub fn set_password(&mut self, password: String) {
+        self.password = Some(password);
+    }
+}
+
+/// One input file for [`OuchWasm::compress_from`]: its bytes are pulled from
+/// `read_at(offset, length) -> Uint8Array` (exactly `size` bytes).
+#[wasm_bindgen]
+#[derive(Default)]
+pub struct CompressFileArgs {
+    #[wasm_bindgen(skip)]
+    pub name: String,
+    #[wasm_bindgen(skip)]
+    pub size: f64,
+    #[wasm_bindgen(skip)]
+    pub mode: u32,
+    #[wasm_bindgen(skip)]
+    pub is_dir: bool,
+    #[wasm_bindgen(skip)]
+    pub read_at: js_sys::Function,
+}
+
+#[wasm_bindgen]
+impl CompressFileArgs {
+    #[wasm_bindgen(constructor)]
+    pub fn new(name: String, size: f64, read_at: js_sys::Function) -> Self {
+        Self {
+            name,
+            size,
+            read_at,
+            mode: 0o644,
+            ..Default::default()
+        }
+    }
+
+    pub fn set_mode(&mut self, mode: u32) {
+        self.mode = mode;
+    }
+
+    pub fn set_dir(&mut self, is_dir: bool) {
+        self.is_dir = is_dir;
     }
 }
 
@@ -615,6 +720,90 @@ fn run_compress(args: &CompressArgs) -> Result<(String, u64, usize)> {
 
     vfs::write_file(Path::new(&args.output), bytes.clone());
     Ok((args.output.clone(), bytes.len() as u64, entries.len()))
+}
+
+/// Stream-compress files pulled from JS. The encoder chain (sink + wrapping
+/// layers) pushes output chunks to `on_chunk`; each input file is read through
+/// a seekable reader, so neither the inputs nor the archive materialize in
+/// wasm memory. Only formats with streamable encoders are supported (tar with
+/// stream layers, and single-stream codecs); see [`crate::wasm::stream_encode`].
+fn run_compress_from(
+    files: &[CompressFileArgs],
+    args: &CompressFromArgs,
+    on_chunk: js_sys::Function,
+) -> Result<(String, u64, usize)> {
+    use crate::wasm::{seekable, stream_encode, stream_encode::Layer};
+
+    let formats = format_from_path_or_flag(&args.output, args.format.as_deref())?;
+    let (first, rest) = split_first_compression_format(&formats);
+    if files.is_empty() {
+        return Err(FinalError::with_title("no files to compress").into());
+    }
+
+    let total = std::rc::Rc::new(std::cell::Cell::new(0u64));
+    let mut top: Box<dyn Layer> = Box::new(stream_encode::ChunkLayer::new(
+        on_chunk,
+        std::rc::Rc::clone(&total),
+    ));
+    for format in rest.iter().rev() {
+        top = stream_encode::wrap_layer(*format, top, args.level).map_err(io_err)?;
+    }
+
+    match first {
+        CompressionFormat::Zip | CompressionFormat::SevenZip => {
+            return Err(FinalError::with_title(format!(
+                "streaming compression to .{} is not supported",
+                first.as_str()
+            ))
+            .hint("the encoder needs a seekable output; use the VFS flow (writeFile + compress) instead")
+            .into());
+        }
+        CompressionFormat::Rar => {
+            return Err(FinalError::with_title("compressing to rar is not supported").into());
+        }
+        CompressionFormat::Tar => {
+            let mut builder = tar::Builder::new(top);
+            for file in files {
+                let mut header = tar::Header::new_gnu();
+                header.set_mode(file.mode & 0o777);
+                if file.is_dir {
+                    header.set_entry_type(tar::EntryType::Directory);
+                    header.set_size(0);
+                    builder.append_data(&mut header, &file.name, std::io::empty())?;
+                } else {
+                    header.set_size(file.size as u64);
+                    let mut reader = seekable::JsSeekReader::new(file.read_at.clone(), file.size as u64);
+                    builder.append_data(&mut header, &file.name, &mut reader)?;
+                }
+            }
+            top = builder.into_inner()?;
+        }
+        non_archive => {
+            top = stream_encode::wrap_layer(non_archive, top, args.level).map_err(io_err)?;
+            if files.len() != 1 || files[0].is_dir {
+                return Err(
+                    FinalError::with_title("a single file is required to compress into a non-archive format").into(),
+                );
+            }
+            let mut reader = seekable::JsSeekReader::new(files[0].read_at.clone(), files[0].size as u64);
+            std::io::copy(&mut reader, &mut top)?;
+        }
+    }
+
+    // Finish the encoder chain outer-to-inner: each layer flushes its trailer
+    // into the next, ending with the chunk sink's final flush.
+    let mut cur: Option<Box<dyn Layer>> = Some(top);
+    while let Some(layer) = cur {
+        cur = layer.finish_layer()?;
+    }
+
+    Ok((args.output.clone(), total.get(), files.len()))
+}
+
+fn io_err(e: std::io::Error) -> crate::Error {
+    crate::Error::Custom {
+        reason: FinalError::with_title("streaming compression failed").detail(format!("{e:?}")),
+    }
 }
 
 fn run_decompress(args: &DecompressArgs) -> Result<(Vec<archives::Entry>, u64)> {

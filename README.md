@@ -68,6 +68,7 @@ const archive = ouch.readFile("docs.tar.gz");
 | `ouch.listFrom(src, opts)`      | List an archive held by a JS-side [`SeekableSource`]. |
 | `ouch.readEntryFrom(src, e)`    | Read one entry via random access (seek, no full load). |
 | `ouch.streamEntryFrom(src, e)`  | Stream one entry from a seekable source in chunks.     |
+| `ouch.compressTo(files, w)`     | **Stream**-compress JS-owned files into a writable.   |
 | `ouch.walk(options)`         | Async-generator over entries, decoded on demand.         |
 | `ouch.clear()`               | Reset the virtual filesystem.                            |
 
@@ -140,6 +141,14 @@ authentication).
   enters wasm memory. `tar.*` chains decode sequentially; wrapped
   zip/7z/rar and `rar` (no random-access reader) fall back to whole-source
   reads. Byte sizes are JS `number`s (exact up to 2^53).
+- **Streaming compression**: `ouch.compressTo(files, writable, options)` (or
+  the module-level `compressTo`) pulls each input file from its
+  [`SeekableSource`] and pushes 256 KiB output chunks to `writable`, so
+  neither inputs nor the archive materialize in wasm memory. Supports `tar`
+  (including chains like `tar.gz` / `tar.xz` / `tar.br`) and the single-stream
+  formats (gz/xz/lzma/lz/lz4/sz/br). `zip`/`7z` need a seekable output and
+  `bz2`'s pure-Rust encoder is one-shot, so those three use the buffered VFS
+  flow (`compress`) — `compressTo` rejects them with a hint.
 - `password` enables AES-256 encryption when compressing to zip/7z;
   encrypted archives need it to list, read or extract. `level` (0-9) applies
   to zip (deflate), 7z (LZMA2) and the streaming formats.

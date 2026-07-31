@@ -6,7 +6,7 @@
 // runs anywhere (local dev box, CI) with whatever tools are present.
 
 import { assertEquals } from "@std/assert";
-import { init, type Ouch } from "./mod.ts";
+import { fromBytes, init, type Ouch } from "./mod.ts";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -114,6 +114,89 @@ async function withTempDir(fn: (dir: string) => Promise<void>): Promise<void> {
     await Deno.remove(dir, { recursive: true });
   }
 }
+
+function joinChunks(chunks: Uint8Array[]): Uint8Array {
+  const joined = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+  let offset = 0;
+  for (const chunk of chunks) {
+    joined.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return joined;
+}
+
+// ---------------------------------------------------------------------------
+// streaming compression (compressTo) vs external tools
+// ---------------------------------------------------------------------------
+
+Deno.test({
+  name: "cross: compressTo gz -> gzip -dc",
+  ignore: !TOOL.gzip,
+  async fn() {
+    const ouch = await init();
+    ouch.clear();
+    const chunks: Uint8Array[] = [];
+    await ouch.compressTo(
+      [{ path: "a.txt", source: fromBytes(bytes(PAYLOAD)) }],
+      new WritableStream<Uint8Array>({
+        write: (c: Uint8Array) => {
+          chunks.push(c);
+        },
+      }),
+      { output: "a.gz" },
+    );
+    await withTempDir(async (tmp) => {
+      await Deno.writeFile(`${tmp}/a.gz`, joinChunks(chunks));
+      const res = run("gzip", ["-dc", "a.gz"], tmp);
+      assertEquals(res.code, 0, res.stderr);
+      assertEquals(text(res.stdout), PAYLOAD);
+    });
+  },
+});
+
+Deno.test({
+  name: "cross: compressTo tar.gz -> tar -tzf / -xzf",
+  ignore: !TOOL.tar,
+  async fn() {
+    const ouch = await init();
+    ouch.clear();
+    const chunks: Uint8Array[] = [];
+    await ouch.compressTo(
+      [
+        {
+          path: "in/hello.txt",
+          source: fromBytes(bytes("hello from streaming")),
+        },
+        { path: "in/sub/nested.txt", source: fromBytes(bytes("nested!")) },
+      ],
+      new WritableStream<Uint8Array>({
+        write: (c: Uint8Array) => {
+          chunks.push(c);
+        },
+      }),
+      { output: "out.tar.gz" },
+    );
+    await withTempDir(async (tmp) => {
+      await Deno.writeFile(`${tmp}/out.tar.gz`, joinChunks(chunks));
+      const listing = run("tar", ["-tzf", "out.tar.gz"], tmp);
+      assertEquals(listing.code, 0, listing.stderr);
+      assertEquals(tarNames(listing.stdout), [
+        "in/hello.txt",
+        "in/sub/nested.txt",
+      ]);
+      const extract = run("tar", ["-xzf", "out.tar.gz"], tmp);
+      assertEquals(extract.code, 0, extract.stderr);
+      assertEquals(
+        text(await Deno.readFile(`${tmp}/in/hello.txt`)),
+        "hello from streaming",
+      );
+      assertEquals(
+        text(await Deno.readFile(`${tmp}/in/sub/nested.txt`)),
+        "nested!",
+      );
+    });
+  },
+});
 
 // ---------------------------------------------------------------------------
 // ouch -> external tools: verify ouch output is standard-compliant

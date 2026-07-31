@@ -1,4 +1,4 @@
-import { assert, assertEquals } from "@std/assert";
+import { assert, assertEquals, assertRejects } from "@std/assert";
 import { fromBytes, fromFile, init, type SeekableSource, walk } from "./mod.ts";
 
 function bytes(text: string): Uint8Array {
@@ -557,6 +557,109 @@ Deno.test("seekable source rejects wrapped zip/7z/rar archives", async () => {
   const src = fromBytes(ouch.readFile("a.zip.gz"));
 
   assertThrows(() => ouch.listFrom(src, { name: "a.zip.gz" }));
+});
+
+function collectWritable(chunks: Uint8Array[]): WritableStream<Uint8Array> {
+  return new WritableStream<Uint8Array>({
+    write(chunk) {
+      chunks.push(chunk);
+    },
+  });
+}
+
+Deno.test("compressTo streams a gz file in chunks", async () => {
+  const ouch = await init();
+  ouch.clear();
+
+  // ~2 MiB of incompressible payload -> several 256 KiB output chunks.
+  const payload = noise(2 * 1024 * 1024);
+  const chunks: Uint8Array[] = [];
+  const result = await ouch.compressTo(
+    [{ path: "big.bin", source: fromBytes(payload) }],
+    collectWritable(chunks),
+    { output: "big.gz" },
+  );
+  assertEquals(result.entries, 1);
+  assertEquals(result.output_size, chunks.reduce((n, c) => n + c.length, 0));
+  assert(chunks.length > 1, "expected the output to arrive in multiple chunks");
+  for (const chunk of chunks) {
+    assert(chunk.length <= 256 * 1024, "chunk exceeds the chunk size");
+  }
+
+  // The streamed bytes form a valid archive: decompress them via the VFS.
+  ouch.writeFile("big.gz", joinChunks(chunks));
+  const unpacked = ouch.decompress({ files: ["big.gz"] });
+  assertEquals(unpacked.files_unpacked, 1);
+  assertEquals(ouch.readFile("big"), payload);
+});
+
+Deno.test("compressTo builds a tar.gz from multiple files", async () => {
+  const ouch = await init();
+  ouch.clear();
+
+  const a = bytes("hello from compressTo");
+  const b = noise(512 * 1024);
+  const chunks: Uint8Array[] = [];
+  const result = await ouch.compressTo(
+    [
+      { path: "docs", source: fromBytes(new Uint8Array(0)), isDir: true },
+      { path: "docs/a.txt", source: fromBytes(a) },
+      { path: "docs/b.bin", source: fromBytes(b) },
+    ],
+    collectWritable(chunks),
+    { output: "docs.tar.gz" },
+  );
+  assertEquals(result.entries, 3);
+
+  ouch.writeFile("docs.tar.gz", joinChunks(chunks));
+  const unpacked = ouch.decompress({ files: ["docs.tar.gz"], outputDir: "x" });
+  assertEquals(unpacked.files_unpacked, 2);
+  assertEquals(ouch.readFile("x/docs/a.txt"), a);
+  assertEquals(ouch.readFile("x/docs/b.bin"), b);
+});
+
+Deno.test("compressTo reads input from a disk file", async () => {
+  const ouch = await init();
+  ouch.clear();
+
+  const payload = bytes("from disk to gz");
+  const tmp = await Deno.makeTempFile();
+  try {
+    await Deno.writeFile(tmp, payload);
+    const src = fromFile(tmp);
+    try {
+      const chunks: Uint8Array[] = [];
+      await ouch.compressTo(
+        [{ path: "d.txt", source: src }],
+        collectWritable(chunks),
+        { output: "d.gz" },
+      );
+      ouch.writeFile("d.gz", joinChunks(chunks));
+      const unpacked = ouch.decompress({ files: ["d.gz"] });
+      assertEquals(unpacked.files_unpacked, 1);
+      assertEquals(text(ouch.readFile("d")), "from disk to gz");
+    } finally {
+      src.close();
+    }
+  } finally {
+    await Deno.remove(tmp);
+  }
+});
+
+Deno.test("compressTo rejects formats that need a buffered encoder", async () => {
+  const ouch = await init();
+  ouch.clear();
+
+  const src = fromBytes(bytes("x"));
+  for (const output of ["out.zip", "out.7z", "out.bz2"]) {
+    await assertRejects(
+      () =>
+        ouch.compressTo([{ path: "f.bin", source: src }], collectWritable([]), {
+          output,
+        }),
+      Error,
+    );
+  }
 });
 
 function assertThrows(fn: () => unknown): void {

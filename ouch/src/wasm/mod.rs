@@ -9,6 +9,7 @@ pub mod archives;
 pub mod codecs;
 pub mod entry;
 pub mod seekable;
+pub mod stream_encode;
 pub mod vfs;
 
 /// Chunk size used by the streaming entry reader ([`crate::wasm::entry::OuchWasm::stream_entry`]).
