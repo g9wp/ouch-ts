@@ -1,0 +1,108 @@
+# ouch-ts
+
+[Ouch](https://github.com/ouch-org/ouch) — a CLI for easily compressing and
+decompressing files — recompiled as a **WASM + TypeScript development library**.
+
+```
+TS API (mod.ts)  ->  ouch wasm (rust)  ->  pure-Rust codecs (zip/tar/7z/gz/xz/...)
+```
+
+## Supported formats
+
+`tar`, `zip`, `7z`, `gz`, `xz`, `lzma`, `lz`, `lz4`, `sz` (snappy), `br` (brotli),
+including chains like `tar.gz`.
+
+Formats that need a C toolchain (`bz2`, `bz3`, `zst`, `rar`) are not available
+in the WASM build.
+
+## Building the wasm package
+
+Requires `rustup` (with the `wasm32-unknown-unknown` target), `wasm-pack`, and
+`deno`.
+
+```sh
+deno task build        # release build of ./ouch/pkg/
+deno task build:dev    # fast dev build
+```
+
+## Usage
+
+```ts
+import { init, walk } from "./mod.ts";
+
+const ouch = await init();
+
+// 1. write inputs into the in-memory virtual filesystem
+ouch.writeFile("docs/hello.txt", new TextEncoder().encode("hello wasm!"));
+
+// 2. compress (format comes from the output extension)
+ouch.compress({ files: ["docs"], output: "docs.tar.gz" });
+
+// 3. list archive contents — each entry reads its bytes lazily
+const entries = ouch.listArchive({ archives: ["docs.tar.gz"] });
+const first = entries[0];
+const bytes = first.bytes; // decodes only this entry from the archive
+
+// 4. iterate lazily without extracting everything
+for await (const entry of walk({ archives: ["docs.tar.gz"] })) {
+  const data = await entry.readable.getReader().read();
+}
+
+// 5. read outputs back out of the VFS
+const archive = ouch.readFile("docs.tar.gz");
+```
+
+## API
+
+| Function                     | Description                                              |
+| ---------------------------- | -------------------------------------------------------- |
+| `init(moduleOrPath?)`        | Load the wasm module (once) and return the `Ouch` API.   |
+| `ouch.writeFile/readFile`    | Input/output of the in-memory virtual filesystem.        |
+| `ouch.compress(options)`     | Compress VFS files into an archive in the VFS.           |
+| `ouch.decompress(options)`   | Extract archives into the VFS.                           |
+| `ouch.listArchive(options)`  | List archive entries; `bytes`/`readable` decode lazily.  |
+| `ouch.readEntry(archive, e)` | Read one entry's bytes from an archive.                  |
+| `ouch.walk(options)`         | Async-generator over entries, decoded on demand.         |
+| `ouch.clear()`               | Reset the virtual filesystem.                            |
+
+## Project layout
+
+```
+├── deno.json       # deno tasks (build / test / check) + publish config
+├── mod.ts          # TypeScript API
+├── mod_test.ts     # end-to-end tests (run: deno test -A)
+├── build.ts        # wasm-pack build script
+├── pkg/            # generated: ouch.js + ouch_bg.wasm + ouch.d.ts
+└── ouch/           # the ouch rust repo (vendor)
+    ├── src/lib.rs  # library root (module gating per feature)
+    ├── src/wasm/   # wasm bindings: vfs / codecs / archives / entry
+    └── pkg/        # intermediate wasm-pack output (gitignored)
+```
+
+## Publishing (JSR)
+
+`deno.json` already carries `name` / `version` / `exports` / `publish.exclude`
+(the whole `ouch/` rust repo is excluded; `pkg/` and `mod.ts` are included).
+
+```sh
+git init        # the workspace root must be a git repo for `deno publish`
+git add -A
+git commit -m "init"
+deno task build # ensure ./pkg is up to date
+# bump the version in deno.json, then:
+deno publish
+```
+
+## Notes
+
+- All file I/O happens inside the wasm module's **in-memory virtual
+  filesystem**; nothing touches the real disk. The VFS is shared by one
+  `Ouch` instance — call `clear()` between independent jobs.
+- `walk` and `listArchive` are fully lazy: entry `bytes`/`readable` decode
+  only that entry from the archive on demand. `decompress` materializes
+  entries into the VFS instead.
+- `password` enables AES-256 encryption when compressing to zip/7z;
+  encrypted archives need it to list, read or extract. `level` (0-9) applies
+  to zip (deflate), 7z (LZMA2) and the streaming formats.
+- The native CLI is unaffected: `cargo build --features cli,use_zlib` (the
+  `bzip3` default feature additionally needs `libclang` for bindgen).

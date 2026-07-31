@@ -1,2 +1,7 @@
 # Generated wasm package (from `deno task build`)
 /pkg/
+
+# wasm-pack intermediate output inside the vendored rust repo
+/ouch/pkg/
+
+.*
