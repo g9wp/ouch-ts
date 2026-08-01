@@ -54,6 +54,22 @@ for await (const entry of walk({ archives: ["docs.tar.gz"] })) {
 const archive = ouch.readFile("docs.tar.gz");
 ```
 
+## Entry points
+
+The package ships three entry points; they share one wasm core and differ only
+in which file helpers they provide (and how they detect the runtime):
+
+| Import                        | File helpers                            |
+| ----------------------------- | --------------------------------------- |
+| `@g9wp/ouch` (default)        | Universal: auto-detect Deno → Node (`process.getBuiltinModule`) → browser `fetch`; accepts explicit `node:fs`-style backends. |
+| `@g9wp/ouch/deno`             | Deno-only: backed directly by `Deno.*` APIs, no detection.        |
+| `@g9wp/ouch/node`             | Node-only: statically imports `node:fs` / `node:fs/promises`, bundler-friendly. |
+
+Pick the subpath matching your runtime to avoid the default entry's probing;
+the default entry stays for browsers, bundlers, and mixed environments.
+`fromBytes` / `fromBlob` and everything else live in the shared core, so all
+three entries expose the same `Ouch` API.
+
 ## API
 
 | Function                     | Description                                              |
@@ -79,9 +95,13 @@ const archive = ouch.readFile("docs.tar.gz");
 ## Project layout
 
 ```
-├── deno.json       # deno tasks (build / test / check) + publish config
-├── mod.ts          # TypeScript API
+├── deno.json       # deno tasks (build / test / check) + exports + publish config
+├── mod.ts          # universal entry: core + auto-detecting file helpers
+├── core.ts         # runtime-agnostic core (Ouch, wasm init, entries, sources/sinks)
+├── deno.ts         # "./deno" entry: Deno file helpers (Deno.* APIs)
+├── node.ts         # "./node" entry: Node file helpers (node:fs / node:fs/promises)
 ├── mod_test.ts     # end-to-end tests (run: deno test -A)
+├── entry_test.ts   # entry-point tests for ./deno and ./node
 ├── cross_test.ts   # interop tests vs external tools (tar/zip/7z/...)
 ├── fixtures/       # sample .zst/.rar archives for codec tests
 ├── build.ts        # wasm-pack build script
