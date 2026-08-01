@@ -674,7 +674,10 @@ async function benchArchives(
   native: string | null,
   data: BenchData,
 ): Promise<void> {
-  for (const archive of data.archives) {
+  // Smallest archives first, so quick results show up immediately and a slow
+  // huge archive can be interrupted without losing everything before it.
+  const sorted = [...data.archives].sort((a, b) => a.size - b.size);
+  for (const archive of sorted) {
     console.log(`--- ${archive.rel} (${mb(archive.size)} archive) ---`);
     const contentDir = await Deno.makeTempDir({ prefix: "ouch-bench-" });
     try {
