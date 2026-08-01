@@ -13,13 +13,15 @@
   "tasks": {
     "build": "deno run -A build.ts",
     "test": "deno test -A",
-    "check": "deno check mod.ts deno.ts node.ts mod_test.ts cross_test.ts entry_test.ts"
+    "bench": "deno run -A bench.ts",
+    "check": "deno check mod.ts deno.ts node.ts mod_test.ts cross_test.ts entry_test.ts bench.ts"
   },
   "publish": {
     "exclude": [
       "!pkg",
       ".github/",
       "build.ts",
+      "bench.ts",
       "mod_test.ts",
       "cross_test.ts",
       "fixtures/",

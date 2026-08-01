@@ -104,6 +104,28 @@ core, so all three entries expose the same core surface.
 | `ouch.walk(options)`         | Async-generator over entries, decoded on demand.         |
 | `ouch.clear()`               | Reset the virtual filesystem.                            |
 
+## Benchmarking
+
+`deno task bench` compares the WASM library against the native ouch CLI and
+external command-line tools (zip/unzip, 7z, tar+gzip, gzip) across four
+scenarios (zip, 7z, tar.gz, gz):
+
+```sh
+deno task bench
+```
+
+- All tools operate on the same on-disk test data set (~4 MiB: compressible
+  text + incompressible binary). The library uses its random-access file
+  sources/sinks (`fromFileSync`/`fileSinkSync`), so disk I/O is included for
+  everyone.
+- Each operation runs 3 times (best-of). Tools that are not installed — and
+  the native CLI, if `./ouch` hasn't been built (`cargo build --release`)
+  — are skipped automatically.
+- On Windows, msys tools (tar/zip/unzip/gzip) run inside the msys bash with
+  paths converted via `cygpath`, because msys path handling disagrees with
+  the Windows paths Deno produces; bash startup is included in their numbers.
+  Native programs (7z, the ouch CLI) are spawned directly.
+
 ## Project layout
 
 ```
@@ -114,6 +136,7 @@ core, so all three entries expose the same core surface.
 ├── mod_test.ts     # end-to-end tests (run: deno test -A)
 ├── entry_test.ts   # entry-point tests for ./deno and ./node
 ├── cross_test.ts   # interop tests vs external tools (tar/zip/7z/...)
+├── bench.ts        # performance comparison (run: deno task bench)
 ├── fixtures/       # sample .zst/.rar archives for codec tests
 ├── build.ts        # wasm-pack build script
 ├── pkg/            # generated: ouch.js + ouch_bg.wasm + ouch.d.ts
