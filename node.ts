@@ -6,14 +6,14 @@
 // with Node bundlers. Positions go through the raw file descriptor, so the
 // same code runs on real Node and Deno's node compatibility layer.
 
-export * from "./core.ts";
+export * from "./mod.ts";
 import {
   fromBytes,
   type AsyncSeekableSink,
   type AsyncSeekableSource,
   type SeekableSink,
   type SeekableSource,
-} from "./core.ts";
+} from "./mod.ts";
 import { closeSync, fstatSync, openSync, readSync, writeSync } from "node:fs";
 import {
   open as openPromise,

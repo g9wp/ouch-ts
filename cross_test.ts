@@ -6,7 +6,8 @@
 // runs anywhere (local dev box, CI) with whatever tools are present.
 
 import { assertEquals } from "@std/assert";
-import { fileSinkSync, fromBytes, init, type Ouch } from "./mod.ts";
+import { fromBytes, init, type Ouch } from "./mod.ts";
+import { fileSinkSync } from "./deno.ts";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();

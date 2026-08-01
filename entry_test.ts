@@ -4,7 +4,7 @@
 import { assert, assertEquals } from "@std/assert";
 import * as denoEntry from "./deno.ts";
 import * as nodeEntry from "./node.ts";
-import { init, type SeekableSource } from "./core.ts";
+import { init, type SeekableSource } from "./mod.ts";
 
 function bytes(text: string): Uint8Array {
   return new TextEncoder().encode(text);

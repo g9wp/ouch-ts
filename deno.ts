@@ -6,14 +6,14 @@
 // Node probing in the universal `mod.ts`. Browsers: use `mod.ts` or `loadFile`
 // via `fetch`. Node: use `@g9wp/ouch/node`.
 
-export * from "./core.ts";
+export * from "./mod.ts";
 import {
   fromBytes,
   type AsyncSeekableSink,
   type AsyncSeekableSource,
   type SeekableSink,
   type SeekableSource,
-} from "./core.ts";
+} from "./mod.ts";
 
 /**
  * A seekable source over a Deno file, opened read-only and kept open until

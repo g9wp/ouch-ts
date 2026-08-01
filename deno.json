@@ -13,7 +13,7 @@
   "tasks": {
     "build": "deno run -A build.ts",
     "test": "deno test -A",
-    "check": "deno check mod.ts core.ts deno.ts node.ts mod_test.ts cross_test.ts entry_test.ts"
+    "check": "deno check mod.ts deno.ts node.ts mod_test.ts cross_test.ts entry_test.ts"
   },
   "publish": {
     "exclude": [

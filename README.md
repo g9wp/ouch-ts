@@ -56,19 +56,29 @@ const archive = ouch.readFile("docs.tar.gz");
 
 ## Entry points
 
-The package ships three entry points; they share one wasm core and differ only
-in which file helpers they provide (and how they detect the runtime):
+The package ships three entry points; they share one wasm core and differ
+only in which file helpers they provide. There is **no runtime detection**: the
+default entry is the runtime-agnostic core, and you pick the file helpers for
+your runtime by importing the matching subpath.
 
 | Import                        | File helpers                            |
 | ----------------------------- | --------------------------------------- |
-| `@g9wp/ouch` (default)        | Universal: auto-detect Deno → Node (`process.getBuiltinModule`) → browser `fetch`; accepts explicit `node:fs`-style backends. |
-| `@g9wp/ouch/deno`             | Deno-only: backed directly by `Deno.*` APIs, no detection.        |
-| `@g9wp/ouch/node`             | Node-only: statically imports `node:fs` / `node:fs/promises`, bundler-friendly. |
+| `@g9wp/ouch` (default)        | None — the runtime-agnostic core only (`fromBytes` / `fromBlob`). |
+| `@g9wp/ouch/deno`             | Deno: `fromFile*`/`fileSink*`/`readFile`/`writeFile`/`loadFile` backed directly by `Deno.*` APIs. |
+| `@g9wp/ouch/node`             | Node: the same helpers backed by static `node:fs` / `node:fs/promises` imports (bundler-friendly). |
 
-Pick the subpath matching your runtime to avoid the default entry's probing;
-the default entry stays for browsers, bundlers, and mixed environments.
-`fromBytes` / `fromBlob` and everything else live in the shared core, so all
-three entries expose the same `Ouch` API.
+```ts
+// Deno
+import { init } from "@g9wp/ouch";
+import { fromFile } from "@g9wp/ouch/deno";
+
+// Node
+import { init } from "@g9wp/ouch";
+import { fromFile } from "@g9wp/ouch/node";
+```
+
+The `Ouch` API, `fromBytes` / `fromBlob` and everything else live in the shared
+core, so all three entries expose the same core surface.
 
 ## API
 
@@ -98,8 +108,7 @@ three entries expose the same `Ouch` API.
 
 ```
 ├── deno.json       # deno tasks (build / test / check) + exports + publish config
-├── mod.ts          # universal entry: core + auto-detecting file helpers
-├── core.ts         # runtime-agnostic core (Ouch, wasm init, entries, sources/sinks)
+├── mod.ts          # runtime-agnostic core (default entry): Ouch, wasm init, sources/sinks
 ├── deno.ts         # "./deno" entry: Deno file helpers (Deno.* APIs)
 ├── node.ts         # "./node" entry: Node file helpers (node:fs / node:fs/promises)
 ├── mod_test.ts     # end-to-end tests (run: deno test -A)
@@ -179,11 +188,10 @@ authentication).
   async source or sink is buffered in JS memory before/during the call —
   prefer the sync variants for huge archives. `loadFile` / `readFile` /
   `writeFile` are the explicit whole-file I/O helpers (use `loadFile` only for
-  moderate files). Deno is detected automatically, then Node's `node:fs` /
-  `node:fs/promises` via `process.getBuiltinModule` (Node ≥ 22.3); pass
-  `node:fs` / `node:fs/promises` (or compatible `SyncFs`/`AsyncFs`) explicitly
-  on older Node / bundlers. Browsers have no file API — use `loadFile` (URLs
-  fall back to `fetch`) or `fromBlob` for a `File`/`Blob`.
+  moderate files). Import the helpers from `@g9wp/ouch/deno` (Deno) or
+  `@g9wp/ouch/node` (Node, static `node:fs` imports) — the default entry has
+  no runtime detection and exposes only the core. Browsers have no file API —
+  use `fromBytes` / `fromBlob` for in-memory sources.
 - **Streaming compression**: `ouch.compressTo(files, writable, options)` (or
   the module-level `compressTo`) pulls each input file from its
   [`SeekableSource`] and pushes 256 KiB output chunks to `writable`, so

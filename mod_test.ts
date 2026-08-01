@@ -1,19 +1,26 @@
 import { assert, assertEquals, assertRejects } from "@std/assert";
 import {
-  fileSink,
-  fileSinkSync,
   fromBlob,
   fromBytes,
-  fromFile,
-  fromFileSync,
   init,
-  loadFile,
-  readFile,
-  type AsyncFs,
   type SeekableSource,
   walk,
-  writeFile,
 } from "./mod.ts";
+import {
+  fileSink,
+  fileSinkSync,
+  fromFile,
+  fromFileSync,
+  loadFile,
+  readFile,
+  writeFile,
+} from "./deno.ts";
+import {
+  fileSink as nodeFileSink,
+  fileSinkSync as nodeFileSinkSync,
+  fromFile as nodeFromFile,
+  fromFileSync as nodeFromFileSync,
+} from "./node.ts";
 
 function bytes(text: string): Uint8Array {
   return new TextEncoder().encode(text);
@@ -660,9 +667,8 @@ Deno.test("compressTo reads input from a disk file", async () => {
   }
 });
 
-Deno.test("fromFileSync / fileSinkSync work through a node:fs backend", async () => {
+Deno.test("node entry: fromFileSync / fileSinkSync work through node:fs", async () => {
   // Exercises the Node position-based I/O path via Deno's node:fs shim.
-  const fs = await import("node:fs");
   const ouch = await init();
   ouch.clear();
 
@@ -670,7 +676,7 @@ Deno.test("fromFileSync / fileSinkSync work through a node:fs backend", async ()
   const tmp = await Deno.makeTempFile();
   try {
     await Deno.writeFile(tmp, payload);
-    const src = fromFileSync(tmp, fs);
+    const src = nodeFromFileSync(tmp);
     try {
       assertEquals(src.size, payload.length);
       assertEquals(text(src.readAt(5, 7)), "backend");
@@ -681,7 +687,7 @@ Deno.test("fromFileSync / fileSinkSync work through a node:fs backend", async ()
     // fileSinkSync via node:fs: zip streams through the sink.
     const sinkPath = `${tmp}.zip`;
     try {
-      const sink = fileSinkSync(sinkPath, fs);
+      const sink = nodeFileSinkSync(sinkPath);
       try {
         const chunks: Uint8Array[] = [];
         await ouch.compressTo(
@@ -883,14 +889,11 @@ Deno.test("fromFile opens a disk handle: random access, no whole-file load", asy
   }
 });
 
-Deno.test("fromFile works through a node:fs/promises backend", async () => {
-  const promises = await import("node:fs/promises");
+Deno.test("node entry: fromFile works through node:fs/promises", async () => {
   const tmp = await Deno.makeTempFile();
   try {
     await Deno.writeFile(tmp, bytes("node promises"));
-    // Deno's node-compat types omit FileHandle's sync methods (the runtime
-    // adapts via `fd` + `node:fs` instead), so cast away the type gap.
-    const src = await fromFile(tmp, promises as unknown as AsyncFs);
+    const src = await nodeFromFile(tmp);
     try {
       assertEquals(text(await src.readAt(0, 13)), "node promises");
     } finally {
@@ -949,11 +952,10 @@ Deno.test("fileSink is an async seekable sink and streams zip compression", asyn
   }
 });
 
-Deno.test("fileSink works through a node:fs/promises backend", async () => {
-  const promises = await import("node:fs/promises");
+Deno.test("node entry: fileSink works through node:fs/promises", async () => {
   const tmp = await Deno.makeTempFile();
   try {
-    const sink = await fileSink(tmp, promises as unknown as AsyncFs);
+    const sink = await nodeFileSink(tmp);
     try {
       await sink.writeAt(0, bytes("node async"));
       assertEquals(await sink.size(), 10);
