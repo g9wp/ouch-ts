@@ -111,16 +111,22 @@ external command-line tools (zip/unzip, 7z, tar+gzip, gzip) across four
 scenarios (zip, 7z, tar.gz, gz):
 
 ```sh
-deno task bench
+deno task bench              # uses ./test_data (or synthetic data)
+deno task bench -- path/to/data   # benchmark a specific directory
 ```
 
-- All tools operate on the same on-disk test data set (~4 MiB: compressible
-  text + incompressible binary). The library uses its random-access file
-  sources/sinks (`fromFileSync`/`fileSinkSync`), so disk I/O is included for
-  everyone.
-- Each operation runs 3 times (best-of). Tools that are not installed — and
-  the native CLI, if `./ouch` hasn't been built (`cargo build --release`)
-  — are skipped automatically.
+- The benchmark reads **every file under `./.test_data`** (recursively) and
+  runs all tools on that data; the single-file `gz` scenario uses the largest
+  file. If `.test_data` is missing or empty it falls back to a generated
+  ~4 MiB synthetic set (compressible text + binary). You can point at another
+  directory with a path argument or `BENCH_DATA=...`, and control iterations
+  with `BENCH_RUNS` (large data sets default to a single run).
+- All tools operate on the same data on disk. The library uses its
+  random-access file sources/sinks (`fromFileSync`/`fileSinkSync`), so disk
+  I/O is included for everyone.
+- Each operation runs 3 times (best-of) by default. Tools that are not
+  installed — and the native CLI, if `./ouch` hasn't been built
+  (`cargo build --release`) — are skipped automatically.
 - On Windows, msys tools (tar/zip/unzip/gzip) run inside the msys bash with
   paths converted via `cygpath`, because msys path handling disagrees with
   the Windows paths Deno produces; bash startup is included in their numbers.

@@ -12,7 +12,10 @@ import type { Ouch } from "./mod.ts";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
-const RUNS = 3; // best-of-N per operation
+
+// Best-of-N per operation. Override with BENCH_RUNS; large data sets default
+// to a single run so the benchmark stays practical.
+let RUNS = 3;
 
 // ---------------------------------------------------------------------------
 // External tool detection
@@ -180,16 +183,82 @@ function noise(length: number): Uint8Array {
 }
 
 interface BenchData {
+  /** Absolute root: CLI tools use it as their cwd (the library reads `files`). */
   dir: string;
+  /** Every file under the root (absolute path + archive-relative path). */
   files: { abs: string; rel: string }[];
+  /** Top-level entries (relative to `dir`) passed to the CLI tools. */
+  topLevel: string[];
+  /** The file used by the single-file (gz) scenario. */
   singleAbs: string;
+  singleRel: string;
+  singleName: string;
+  singleSize: number;
   totalBytes: number;
+  /** Human-readable description of the data source for the header. */
+  sourceLabel: string;
 }
 
+/** Recursively collect every file under `root`. */
+async function collectFiles(
+  root: string,
+): Promise<{ abs: string; rel: string; size: number }[]> {
+  const out: { abs: string; rel: string; size: number }[] = [];
+  async function walk(dir: string, prefix: string): Promise<void> {
+    for await (const entry of Deno.readDir(dir)) {
+      const abs = `${dir}/${entry.name}`;
+      const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (entry.isDirectory) {
+        await walk(abs, rel);
+      } else if (entry.isFile) {
+        out.push({ abs, rel, size: (await Deno.stat(abs)).size });
+      }
+    }
+  }
+  await walk(root, "");
+  return out;
+}
+
+function mb(bytes: number): string {
+  return `${(bytes / 1e6).toFixed(1)} MiB`;
+}
+
+/** Use `BENCH_DATA` (or a path argument, or `./.test_data`) when it has files;
+ * otherwise generate synthetic data. */
 async function makeData(): Promise<BenchData> {
+  const dataPath = Deno.args[0] ?? Deno.env.get("BENCH_DATA") ?? "./.test_data";
+  try {
+    const stat = await Deno.stat(dataPath);
+    if (stat.isDirectory) {
+      const root = await Deno.realPath(dataPath);
+      const collected = await collectFiles(root);
+      if (collected.length > 0) {
+        const topLevel: string[] = [];
+        for await (const entry of Deno.readDir(root)) topLevel.push(entry.name);
+        const largest = collected.reduce((a, b) => (b.size > a.size ? b : a));
+        return {
+          dir: root,
+          files: collected.map(({ abs, rel }) => ({ abs, rel })),
+          topLevel,
+          singleAbs: largest.abs,
+          singleRel: largest.rel,
+          singleName: largest.rel.split("/").pop()!,
+          singleSize: largest.size,
+          totalBytes: collected.reduce((n, f) => n + f.size, 0),
+          sourceLabel:
+            `${dataPath} (${collected.length} files, ` +
+            `${mb(collected.reduce((n, f) => n + f.size, 0))})`,
+        };
+      }
+    }
+  } catch {
+    // data path missing or unreadable — fall through to synthetic data
+  }
+
   const dir = await Deno.makeTempDir({ prefix: "ouch-bench-" });
   const files: { abs: string; rel: string }[] = [];
   let totalBytes = 0;
+  let textBytes = 0;
 
   await Deno.mkdir(`${dir}/text`, { recursive: true });
   for (let i = 0; i < 8; i++) {
@@ -199,6 +268,7 @@ async function makeData(): Promise<BenchData> {
     await Deno.writeFile(`${dir}/${rel}`, data);
     files.push({ abs: `${dir}/${rel}`, rel });
     totalBytes += data.length;
+    textBytes += data.length;
   }
 
   await Deno.mkdir(`${dir}/bin`, { recursive: true });
@@ -212,7 +282,19 @@ async function makeData(): Promise<BenchData> {
   await Deno.writeFile(`${dir}/single.txt`, single);
   totalBytes += single.length;
 
-  return { dir, files, singleAbs: `${dir}/single.txt`, totalBytes };
+  return {
+    dir,
+    files,
+    topLevel: ["text", "bin"],
+    singleAbs: `${dir}/single.txt`,
+    singleRel: "single.txt",
+    singleName: "single.txt",
+    singleSize: single.length,
+    totalBytes,
+    sourceLabel:
+      `synthetic (${mb(textBytes)} compressible text + ${mb(bin.length)} binary; ` +
+      `put files in ./.test_data to benchmark real data)`,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -225,10 +307,10 @@ async function libCompress(
   format: "zip" | "7z" | "tar.gz" | "gz",
   out: string,
 ): Promise<void> {
-  // gz is a single-file format: compress only single.txt. The archive formats
-  // take the whole text/ + bin/ tree.
+  // gz is a single-file format: compress only the single file. The archive
+  // formats take the whole tree.
   const files = format === "gz"
-    ? [{ path: "single.txt", source: fromFileSync(data.singleAbs) }]
+    ? [{ path: data.singleName, source: fromFileSync(data.singleAbs) }]
     : data.files.map((f) => ({
       path: f.rel,
       source: fromFileSync(f.abs),
@@ -312,18 +394,19 @@ async function libDecompress(
 
 /**
  * Single-file formats (gz) have no random-access reader: decode via the
- * virtual filesystem (the archive is loaded into wasm memory — 2 MiB here).
+ * virtual filesystem (the archive is loaded into wasm memory).
  */
 async function libGzDecompress(
   ouch: Ouch,
   archive: string,
   outDir: string,
+  singleName: string,
 ): Promise<void> {
   ouch.clear();
   ouch.writeFile("a.gz", await Deno.readFile(archive));
   const [entry] = ouch.listArchive({ archives: ["a.gz"] });
   await Deno.mkdir(outDir, { recursive: true });
-  const file = await Deno.open(`${outDir}/single.txt`, {
+  const file = await Deno.open(`${outDir}/${singleName}`, {
     write: true,
     create: true,
     truncate: true,
@@ -380,7 +463,9 @@ async function measureLib(
       libCompress(ouch, data, scenario, archive)
     );
     const decompressMs = scenario === "gz"
-      ? await bestOf(RUNS, () => libGzDecompress(ouch, archive, `${work}/out`))
+      ? await bestOf(RUNS, () =>
+        libGzDecompress(ouch, archive, `${work}/out`, data.singleName)
+      )
       : await bestOf(RUNS, () => libDecompress(ouch, archive, `${work}/out`, name));
     return { compressMs, decompressMs };
   } finally {
@@ -397,11 +482,11 @@ async function measureNative(
   try {
     const ext = scenario === "tar.gz" ? "tar.gz" : scenario;
     const archive = `${work}/a.${ext}`;
-    const inputs = scenario === "gz" ? "single.txt" : "text bin";
+    const inputs = scenario === "gz" ? [data.singleRel] : data.topLevel;
     const compressMs = await bestOf(RUNS, () =>
       runTool(
         native,
-        ["-q", "-y", "compress", ...inputs.split(" "), archive],
+        ["-q", "-y", "compress", ...inputs, archive],
         data.dir,
         false, // the native CLI is a Windows program: keep Windows paths
       )
@@ -432,7 +517,7 @@ async function measureExternal(
         if (!TOOLS.zip || !TOOLS.unzip) return null;
         const archive = `${work}/a.zip`;
         const compressMs = await bestOf(RUNS, () =>
-          runTool("zip", ["-r", "-q", archive, "text", "bin"], data.dir)
+          runTool("zip", ["-r", "-q", archive, ...data.topLevel], data.dir)
         );
         await Deno.mkdir(`${work}/out`, { recursive: true });
         const decompressMs = await bestOf(RUNS, () =>
@@ -444,7 +529,7 @@ async function measureExternal(
         if (!TOOLS["7z"]) return null;
         const archive = `${work}/a.7z`;
         const compressMs = await bestOf(RUNS, () =>
-          runTool("7z", ["a", "-bd", archive, "text", "bin"], data.dir, false)
+          runTool("7z", ["a", "-bd", archive, ...data.topLevel], data.dir, false)
         );
         await Deno.mkdir(`${work}/out`, { recursive: true });
         const decompressMs = await bestOf(RUNS, () =>
@@ -458,7 +543,7 @@ async function measureExternal(
         const compressMs = await bestOf(RUNS, () =>
           runTool(
             "tar",
-            ["-czf", archive, "text", "bin"],
+            ["-czf", archive, ...data.topLevel],
             data.dir,
           )
         );
@@ -476,13 +561,13 @@ async function measureExternal(
         if (!TOOLS.gzip) return null;
         const archive = `${work}/a.gz`;
         const compressMs = await bestOf(RUNS, async () => {
-          const gz = runToolCapture("gzip", ["-c", "single.txt"], data.dir);
+          const gz = runToolCapture("gzip", ["-c", data.singleRel], data.dir);
           await Deno.writeFile(archive, gz);
         });
         await Deno.mkdir(`${work}/out`, { recursive: true });
         const decompressMs = await bestOf(RUNS, async () => {
           const raw = runToolCapture("gzip", ["-dc", archive], work);
-          await Deno.writeFile(`${work}/out/single.txt`, raw);
+          await Deno.writeFile(`${work}/out/${data.singleName}`, raw);
         });
         return { compressMs, decompressMs };
       }
@@ -521,13 +606,13 @@ async function run() {
   const data = await makeData();
 
   const inputBytes = data.totalBytes;
-  const compressible = inputBytes - 1024 * 1024;
+  RUNS = Number(Deno.env.get("BENCH_RUNS") ?? "0") ||
+    (inputBytes > 512e6 ? 1 : 3);
 
   console.log("=== ouch performance benchmark ===");
   console.log(
-    `test data: ${(inputBytes / 1e6).toFixed(1)} MiB total ` +
-      `(${(compressible / 1e6).toFixed(1)} MiB compressible text + 1.0 MiB binary), ` +
-      `${RUNS} runs, best-of`,
+    `test data: ${data.sourceLabel}, ${RUNS} runs, best-of` +
+      (Deno.env.get("BENCH_RUNS") ? ` (BENCH_RUNS=${Deno.env.get("BENCH_RUNS")})` : ""),
   );
   if (native) {
     console.log(`native ouch cli: ${native}`);
@@ -545,7 +630,7 @@ async function run() {
   console.log();
 
   for (const scenario of ["zip", "7z", "tar.gz", "gz"] as Scenario[]) {
-    const bytes = scenario === "gz" ? 2 * 1024 * 1024 : inputBytes;
+    const bytes = scenario === "gz" ? data.singleSize : inputBytes;
     console.log(`--- ${scenario} ---`);
     console.log(
       `${"tool".padEnd(12)} ${"compress".padEnd(28)} ${"decompress".padEnd(28)}`,
