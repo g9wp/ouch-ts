@@ -1,12 +1,15 @@
 import { assert, assertEquals, assertRejects } from "@std/assert";
 import {
+  fileSink,
   fileSinkSync,
   fromBlob,
   fromBytes,
   fromFile,
   fromFileSync,
   init,
+  loadFile,
   readFile,
+  type AsyncFs,
   type SeekableSource,
   walk,
   writeFile,
@@ -821,7 +824,7 @@ Deno.test("compressTo zip via file sink with encryption", async () => {
   }
 });
 
-Deno.test("readFile / writeFile / fromFile roundtrip", async () => {
+Deno.test("readFile / writeFile / loadFile roundtrip", async () => {
   const ouch = await init();
   ouch.clear();
 
@@ -834,10 +837,47 @@ Deno.test("readFile / writeFile / fromFile roundtrip", async () => {
     await writeFile(tmp, archive);
     assertEquals(await readFile(tmp), archive);
 
-    const src = await fromFile(tmp);
+    // loadFile buffers the whole file (explicitly named as such).
+    const src = await loadFile(tmp);
     const entries = ouch.listFrom(src, { name: "a.zip" });
     assertEquals(entries.map((e) => e.path), ["a.txt"]);
     assertEquals(text(entries[0].bytes), "async file io");
+  } finally {
+    await Deno.remove(tmp);
+  }
+});
+
+Deno.test("fromFile opens a disk handle: random access, no whole-file load", async () => {
+  const ouch = await init();
+  ouch.clear();
+
+  // 4 MiB of incompressible payload: the zip central directory is at the end,
+  // so a random-access source only touches metadata during listFrom.
+  const payload = noise(4 * 1024 * 1024);
+  ouch.writeFile("big.bin", payload);
+  ouch.compress({ files: ["big.bin"], output: "big.zip" });
+  const archive = ouch.readFile("big.zip");
+  assert(archive.length > payload.length);
+
+  const tmp = await Deno.makeTempFile({ suffix: ".zip" });
+  try {
+    await Deno.writeFile(tmp, archive);
+
+    const src = await fromFile(tmp);
+    try {
+      assertEquals(src.size, archive.length);
+      // Live handle: seeking to an arbitrary offset returns those exact bytes.
+      const mid = Math.floor(archive.length / 2);
+      assertEquals([...src.readAt(mid, 8)], [...archive.slice(mid, mid + 8)]);
+      assertEquals(src.readAt(archive.length + 10, 16).length, 0);
+
+      const entries = ouch.listFrom(src, { name: "big.zip" });
+      assertEquals(entries.map((e) => e.path), ["big.bin"]);
+    } finally {
+      await src.close();
+    }
+    // A buffered source would keep working after close; a handle must not.
+    assertThrows(() => src.readAt(0, 4));
   } finally {
     await Deno.remove(tmp);
   }
@@ -848,8 +888,52 @@ Deno.test("fromFile works through a node:fs/promises backend", async () => {
   const tmp = await Deno.makeTempFile();
   try {
     await Deno.writeFile(tmp, bytes("node promises"));
-    const src = await fromFile(tmp, promises);
-    assertEquals(text(src.readAt(0, 13)), "node promises");
+    // Deno's node-compat types omit FileHandle's sync methods (the runtime
+    // adapts via `fd` + `node:fs` instead), so cast away the type gap.
+    const src = await fromFile(tmp, promises as unknown as AsyncFs);
+    try {
+      assertEquals(text(src.readAt(0, 13)), "node promises");
+    } finally {
+      await src.close();
+    }
+  } finally {
+    await Deno.remove(tmp);
+  }
+});
+
+Deno.test("fileSink streams zip compression through an async-opened handle", async () => {
+  const ouch = await init();
+  ouch.clear();
+
+  const a = bytes("async sink zip");
+  const b = noise(256 * 1024);
+  const tmp = await Deno.makeTempFile({ suffix: ".zip" });
+  try {
+    const sink = await fileSink(tmp);
+    try {
+      const chunks: Uint8Array[] = [];
+      const result = await ouch.compressTo(
+        [
+          { path: "a.txt", source: fromBytes(a) },
+          { path: "b.bin", source: fromBytes(b) },
+        ],
+        collectWritable(chunks),
+        { output: "out.zip", sink },
+      );
+      assertEquals(result.entries, 2);
+      assertEquals(
+        result.output_size,
+        chunks.reduce((n, c) => n + c.length, 0),
+      );
+
+      ouch.writeFile("out.zip", joinChunks(chunks));
+      const unpacked = ouch.decompress({ files: ["out.zip"], outputDir: "x" });
+      assertEquals(unpacked.files_unpacked, 2);
+      assertEquals(ouch.readFile("x/a.txt"), a);
+      assertEquals(ouch.readFile("x/b.bin"), b);
+    } finally {
+      await sink.close();
+    }
   } finally {
     await Deno.remove(tmp);
   }

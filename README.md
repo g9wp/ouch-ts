@@ -70,7 +70,9 @@ const archive = ouch.readFile("docs.tar.gz");
 | `ouch.streamEntryFrom(src, e)`  | Stream one entry from a seekable source in chunks.     |
 | `ouch.compressTo(files, w)`     | **Stream**-compress JS-owned files into a writable.   |
 | `readFile/writeFile`          | Async whole-file I/O (Deno / Node / browser fetch).   |
-| `fromFile(path)` / `fromBlob(b)` | Async file/Blob -> seekable source.             |
+| `fromFile(path)` / `fromFileSync(path)` | Random-access disk sources (async/sync open). |
+| `fileSink(path)` / `fileSinkSync(path)` | Random-access disk sinks for zip/7z streaming. |
+| `loadFile(path)` / `fromBlob(b)` | Whole-file buffered seekable sources.       |
 | `ouch.walk(options)`         | Async-generator over entries, decoded on demand.         |
 | `ouch.clear()`               | Reset the virtual filesystem.                            |
 
@@ -135,26 +137,31 @@ authentication).
   `readEntry()` / `entry.bytes` / `decompress()` still materialize the whole
   entry in memory — prefer streaming for anything large.
 - **Random access via `SeekableSource`**: `listFrom` / `readEntryFrom` /
-  `streamEntryFrom` keep the archive on the JS side (`fromBytes`, or
-  `fromFileSync`/`fileSinkSync` in Deno and Node) and wasm pulls only the
-  ranges it needs through a synchronous `readAt(offset, length)` callback.
-  Zip metadata (central directory), tar headers and 7z headers are read by
-  seeking, and a single entry is decompressed by seeking to its data — the
-  whole archive never enters wasm memory. `tar.*` chains decode sequentially;
-  wrapped zip/7z/rar and `rar` (no random-access reader) fall back to
-  whole-source reads. Byte sizes are JS `number`s (exact up to 2^53).
+  `streamEntryFrom` keep the archive on the JS side (`fromBytes`, or the
+  file handles `fromFile`/`fromFileSync` and `fileSink`/`fileSinkSync` in
+  Deno and Node) and wasm pulls only the ranges it needs through a
+  synchronous `readAt(offset, length)` callback. Zip metadata (central
+  directory), tar headers and 7z headers are read by seeking, and a single
+  entry is decompressed by seeking to its data — the whole archive never
+  enters wasm memory. `tar.*` chains decode sequentially; wrapped
+  zip/7z/rar and `rar` (no random-access reader) fall back to whole-source
+  reads. Byte sizes are JS `number`s (exact up to 2^53).
 
-  File helpers are async by default (sync gets the `Sync` suffix):
-  `fromFileSync`/`fileSinkSync` keep synchronous random-access handles;
-  `fromFile`/`readFile`/`writeFile` are promise-based whole-file I/O. Deno is
-  detected automatically, then Node's `node:fs` via
-  `process.getBuiltinModule` (Node ≥ 22.3); pass `node:fs` (or a compatible
-  `SyncFs`/`AsyncFs`) explicitly on older Node / bundlers. Browsers have no
-  synchronous file API — use `fromFile` (falls back to `fetch`) or `fromBlob`
-  to load a `File`/`Blob` into a buffered source. Note the wasm parsers are
-  synchronous, so random-access reads during parsing use the sync callbacks;
-  the async helpers cover the I/O around them (loading inputs, writing
-  outputs).
+  File helpers are async by default (sync gets the `Sync` suffix).
+  `fromFile` / `fileSink` open a Deno/Node file handle asynchronously and
+  expose synchronous random access over it (only the *open* blocks the
+  event loop — reads hit the disk at the requested offset, no whole-file
+  load); `fromFileSync` / `fileSinkSync` are the same with a synchronous
+  open. `loadFile` / `readFile` / `writeFile` are the explicit whole-file
+  I/O helpers (use `loadFile` only for moderate files). Deno is detected
+  automatically, then Node's `node:fs` / `node:fs/promises` via
+  `process.getBuiltinModule` (Node ≥ 22.3); pass `node:fs` /
+  `node:fs/promises` (or compatible `SyncFs`/`AsyncFs`) explicitly on older
+  Node / bundlers. Browsers have no file API — use `loadFile` (URLs fall
+  back to `fetch`) or `fromBlob` for a `File`/`Blob`. Note the wasm parsers
+  are synchronous, so random-access reads during parsing use the sync
+  callbacks; the async helpers cover the I/O around them (opening handles,
+  loading inputs, writing outputs).
 - **Streaming compression**: `ouch.compressTo(files, writable, options)` (or
   the module-level `compressTo`) pulls each input file from its
   [`SeekableSource`] and pushes 256 KiB output chunks to `writable`, so
@@ -165,6 +172,8 @@ authentication).
   written to a file and streamed back in chunks (bounded memory, real
   backpressure); `bz2`'s pure-Rust encoder is one-shot, so it uses the
   buffered VFS flow (`compress`) — `compressTo` rejects those with a hint.
+  The sinks `fileSink(path)` / `fileSinkSync(path)` are async/sync
+  counterparts of the same handle.
 - `password` enables AES-256 encryption when compressing to zip/7z;
   encrypted archives need it to list, read or extract. `level` (0-9) applies
   to zip (deflate), 7z (LZMA2) and the streaming formats.

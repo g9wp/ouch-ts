@@ -45,8 +45,9 @@ export type OuchFormat =
  * directory, tar headers, 7z header) lives at known offsets, and a single
  * entry can be decompressed by seeking to its data — so the whole archive
  * never needs to enter wasm memory. `readAt` must be synchronous; see
- * [`fromBytes`], [`fromFileSync`] (random-access file handles) and
- * [`fromFile`] (async whole-file load) for ready-made implementations.
+ * [`fromBytes`], [`fromFileSync`] / [`fromFile`] (random-access file
+ * handles, sync and async open) and [`loadFile`] / [`fromBlob`]
+ * (whole-file buffers) for ready-made implementations.
  */
 export interface SeekableSource {
   /** Total byte length of the source. */
@@ -271,12 +272,34 @@ function openNodeFile(
 
 /**
  * The promise-based `fs` API subset used by [`readFile`] /
- * [`writeFile`] / [`fromFile`]. Pass `node:fs/promises` (or a
- * compatible shim); Deno is detected automatically.
+ * [`writeFile`] / [`loadFile`] and the async handles of [`fromFile`] /
+ * [`fileSink`]. Pass `node:fs/promises` (or a compatible shim); Deno is
+ * detected automatically.
  */
 export interface AsyncFs {
   readFile(path: string | URL): Promise<Uint8Array>;
   writeFile(path: string | URL, data: Uint8Array): Promise<void>;
+  /** `node:fs/promises.open`, used by [`fromFile`] / [`fileSink`]. */
+  open?(path: string | URL, flags: string): Promise<AsyncFileHandle>;
+}
+
+/** Minimal `node:fs/promises` `FileHandle`-shaped handle. */
+export interface AsyncFileHandle {
+  statSync(): { size: number };
+  readSync(
+    buffer: Uint8Array,
+    offset: number,
+    length: number,
+    position: number,
+  ): number;
+  writeSync(
+    buffer: Uint8Array,
+    offset: number,
+    length: number,
+    position: number,
+  ): number;
+  closeSync(): void;
+  close(): Promise<void>;
 }
 
 /** Asynchronously read a whole file (Deno / Node / browser `fetch` for URLs). */
@@ -297,12 +320,66 @@ export async function writeFile(
 }
 
 /**
- * Asynchronously load a file into memory and return a buffered seekable
- * source. Unlike [`fromFileSync`] (random-access sync handles), this reads the
- * whole file through async I/O — best for moderate files, and the way to use
- * disk files from browsers (via `fetch`, or [`fromBlob`]).
+ * Asynchronously open a file and return a seekable random-access source —
+ * the async counterpart of [`fromFileSync`]. Only the *open* is async:
+ * `readAt` stays synchronous (the wasm parsers run synchronously), but every
+ * read hits the disk at the requested offset — no whole-file load — so
+ * listing a huge archive only touches its header blocks. Deno is detected
+ * automatically; in Node, `node:fs/promises` is picked up via
+ * `process.getBuiltinModule` (or pass `fs` explicitly). Close the handle with
+ * `await src.close()`.
  */
 export async function fromFile(
+  path: string | URL,
+  fs?: AsyncFs,
+): Promise<SeekableSource & { close(): Promise<void> }> {
+  const file = await openFileAsync(path, fs, "r");
+  return {
+    size: file.statSize(),
+    readAt(offset, length) {
+      return file.readAt(offset, length);
+    },
+    close() {
+      return file.close();
+    },
+  };
+}
+
+/**
+ * Asynchronously create a seekable sink over a file — the async counterpart
+ * of [`fileSinkSync`]. Streaming zip/7z compression writes into the sink
+ * (a Deno/Node file) and the archive is streamed back in chunks, so wasm
+ * memory stays bounded. Close the handle with `await sink.close()`.
+ */
+export async function fileSink(
+  path: string | URL,
+  fs?: AsyncFs,
+): Promise<SeekableSink & { close(): Promise<void> }> {
+  const file = await openFileAsync(path, fs, "rw");
+  return {
+    get size() {
+      return file.statSize();
+    },
+    writeAt(offset, bytes) {
+      return file.writeAt(offset, bytes);
+    },
+    readAt(offset, length) {
+      return file.readAt(offset, length);
+    },
+    close() {
+      return file.close();
+    },
+  };
+}
+
+/**
+ * Asynchronously load a *whole* file into memory as a buffered seekable
+ * source (Deno / Node / browser `fetch` for URLs). Prefer [`fromFile`] /
+ * [`fromFileSync`] for anything large — they read from disk on demand
+ * instead of copying everything up front. For browser `File`/`Blob` objects
+ * use [`fromBlob`].
+ */
+export async function loadFile(
   path: string | URL,
   fs?: AsyncFs,
 ): Promise<SeekableSource> {
@@ -347,6 +424,127 @@ function nodeAsyncFs(): AsyncFs | undefined {
   return (getBuiltin("node:fs/promises") ?? getBuiltin("fs/promises")) as
     | AsyncFs
     | undefined;
+}
+
+interface DenoOpenLike {
+  open(
+    path: string | URL,
+    opts: { read: true; write?: true; create?: true; truncate?: true },
+  ): Promise<{
+    statSync(): { size: number };
+    seekSync(offset: number, mode: number): number;
+    readSync(buf: Uint8Array): number | null;
+    writeSync(bytes: Uint8Array): number;
+    close(): void;
+  }>;
+}
+
+/** Common view over an async-opened Deno file handle or Node FileHandle. */
+interface AsyncOpenHandle {
+  statSize(): number;
+  readAt(offset: number, length: number): Uint8Array;
+  writeAt(offset: number, bytes: Uint8Array): number;
+  close(): Promise<void>;
+}
+
+/**
+ * Open a file asynchronously, then adapt it to synchronous random access.
+ * An explicitly passed `fs` wins (so Node backends are testable from Deno);
+ * otherwise Deno's `Deno.open` and then Node's `fs/promises` are detected.
+ */
+async function openFileAsync(
+  path: string | URL,
+  fs: AsyncFs | undefined,
+  mode: "r" | "rw",
+): Promise<AsyncOpenHandle> {
+  if (fs?.open) {
+    return adaptAsyncHandle(await fs.open(path, mode === "rw" ? "w+" : "r"));
+  }
+  const deno = (globalThis as unknown as { Deno?: DenoOpenLike }).Deno;
+  if (deno?.open) {
+    const file = await deno.open(
+      path,
+      mode === "rw"
+        ? { read: true, write: true, create: true, truncate: true }
+        : { read: true },
+    );
+    return {
+      statSize() {
+        return file.statSync().size;
+      },
+      readAt(offset, length) {
+        // Deno.SeekMode.Start === 0
+        file.seekSync(offset, 0);
+        const buf = new Uint8Array(length);
+        const n = file.readSync(buf);
+        return n === null ? new Uint8Array(0) : buf.slice(0, n);
+      },
+      writeAt(offset, bytes) {
+        file.seekSync(offset, 0);
+        file.writeSync(bytes);
+        return offset + bytes.length;
+      },
+      close() {
+        return Promise.resolve(file.close());
+      },
+    };
+  }
+  const nfs = await nodeAsyncFs();
+  if (nfs?.open) {
+    return adaptAsyncHandle(await nfs.open(path, mode === "rw" ? "w+" : "r"));
+  }
+  throw new Error(
+    "fromFile/fileSink need Deno or Node; pass a node:fs/promises-like `fs` in other runtimes",
+  );
+}
+
+/**
+ * Adapt a `node:fs/promises` `FileHandle` (or Deno's node-compat handle) to
+ * synchronous random access. Real Node (>= 20.1) FileHandles expose
+ * `readSync`/`writeSync`/`statSync`; Deno's node-compat FileHandle does not,
+ * but it exposes `fd`, so sync reads route through `node:fs` instead.
+ */
+function adaptAsyncHandle(handle: unknown): AsyncOpenHandle {
+  const h = handle as {
+    fd?: number;
+    statSync?: () => { size: number };
+    readSync?(
+      buffer: Uint8Array,
+      offset: number,
+      length: number,
+      position: number,
+    ): number;
+    writeSync?(
+      buffer: Uint8Array,
+      offset: number,
+      length: number,
+      position: number,
+    ): number;
+    close(): Promise<void>;
+  };
+  const syncFs = h.readSync ? undefined : nodeFs();
+  const fd = h.fd ?? -1;
+  return {
+    statSize() {
+      if (h.statSync) return h.statSync().size;
+      return syncFs!.fstatSync(fd).size;
+    },
+    readAt(offset, length) {
+      const buf = new Uint8Array(length);
+      const n = h.readSync
+        ? h.readSync(buf, 0, length, offset)
+        : syncFs!.readSync(fd, buf, 0, length, offset);
+      return n <= 0 ? new Uint8Array(0) : buf.slice(0, n);
+    },
+    writeAt(offset, bytes) {
+      if (h.writeSync) h.writeSync(bytes, 0, bytes.length, offset);
+      else syncFs!.writeSync(fd, bytes, 0, bytes.length, offset);
+      return offset + bytes.length;
+    },
+    close() {
+      return h.close();
+    },
+  };
 }
 
 export interface CompressOptions {
@@ -663,9 +861,10 @@ export class Ouch {
    * from each file's source in bounded chunks. `tar` (including chains like
    * `tar.gz` / `tar.xz` / `tar.br`) and the single-stream formats push output
    * chunks directly to `writable`; `zip`/`7z` write into `options.sink` (a
-   * host-side seekable file, see [`fileSinkSync`]) because their encoders need a
-   * seekable output, then stream the file back in chunks — wasm memory stays
-   * bounded either way. `bz2` needs the buffered VFS flow ([`Ouch#compress`]).
+   * host-side seekable file, see [`fileSink`] / [`fileSinkSync`]) because
+   * their encoders need a seekable output, then stream the file back in
+   * chunks — wasm memory stays bounded either way. `bz2` needs the buffered
+   * VFS flow ([`Ouch#compress`]).
    */
   async compressTo(
     files: CompressFile[],
