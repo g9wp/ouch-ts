@@ -18,9 +18,13 @@ const args = [
 
 console.log(`wasm-pack ${args.join(" ")}`);
 
+// Enable wasm SIMD for the codecs (miniz_oxide deflate/inflate, ...): the
+// biggest cheap throughput win for the wasm target. All modern engines
+// (Deno, Node, browsers) support simd128.
 const cmd = new Deno.Command("wasm-pack", {
   args,
   cwd: "./ouch",
+  env: { RUSTFLAGS: "-C target-feature=+simd128" },
   stdout: "inherit",
   stderr: "inherit",
 });
