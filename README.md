@@ -208,7 +208,10 @@ authentication).
   seeking, and a single entry is decompressed by seeking to its data — the
   whole archive never enters wasm memory. `tar.*` chains decode sequentially;
   wrapped zip/7z/rar and `rar` (no random-access reader) fall back to
-  whole-source reads. Byte sizes are JS `number`s (exact up to 2^53).
+  whole-source reads. Sequential reads (entry data) are served from a 128 KiB
+  internal buffer, so small parser reads collapse into one larger wasm↔JS
+  call; cold reads after a seek stay unbuffered so metadata/skipped ranges
+  are not over-read. Byte sizes are JS `number`s (exact up to 2^53).
 
   File helpers are async by default (sync gets the `Sync` suffix).
   `fromFile` returns an [`AsyncSeekableSource`] whose `size()`/`readAt()`/
