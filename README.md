@@ -107,20 +107,23 @@ core, so all three entries expose the same core surface.
 ## Benchmarking
 
 `deno task bench` compares the WASM library against the native ouch CLI and
-external command-line tools (zip/unzip, 7z, tar+gzip, gzip) across four
-scenarios (zip, 7z, tar.gz, gz):
+external command-line tools (zip/unzip, 7z, tar+gzip, gzip):
 
 ```sh
-deno task bench              # uses ./test_data (or synthetic data)
+deno task bench              # uses ./.test_data (or synthetic data)
 deno task bench -- path/to/data   # benchmark a specific directory
 ```
 
-- The benchmark reads **every file under `./.test_data`** (recursively) and
-  runs all tools on that data; the single-file `gz` scenario uses the largest
-  file. If `.test_data` is missing or empty it falls back to a generated
-  ~4 MiB synthetic set (compressible text + binary). You can point at another
-  directory with a path argument or `BENCH_DATA=...`, and control iterations
-  with `BENCH_RUNS` (large data sets default to a single run).
+- When the data directory contains **archive files** (.zip/.7z/.tar.gz/.tar/
+  .gz), **each archive is benchmarked individually**: first every tool
+  decompresses it, then every tool re-compresses its extracted contents. Each
+  archive gets its own section with per-tool `decompress` / `compress` rows.
+- Without archives, the whole directory is compressed/extracted once per
+  format (zip, 7z, tar.gz, gz). If the directory is missing or empty, a
+  ~4 MiB synthetic set (compressible text + binary) is generated.
+- You can point at another directory with a path argument or `BENCH_DATA=...`,
+  and control iterations with `BENCH_RUNS` (large data sets default to a
+  single run).
 - All tools operate on the same data on disk. The library uses its
   random-access file sources/sinks (`fromFileSync`/`fileSinkSync`), so disk
   I/O is included for everyone.
