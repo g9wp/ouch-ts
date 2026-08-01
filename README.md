@@ -71,7 +71,7 @@ const archive = ouch.readFile("docs.tar.gz");
 | `ouch.compressTo(files, w)`     | **Stream**-compress JS-owned files into a writable.   |
 | `readFile/writeFile`          | Async whole-file I/O (Deno / Node / browser fetch).   |
 | `fromFile(path)` / `fromFileSync(path)` | Random-access disk sources (async/sync open). |
-| `fileSink(path)` / `fileSinkSync(path)` | Random-access disk sinks for zip/7z streaming. |
+| `fileSink(path)` / `fileSinkSync(path)` | Random-access disk sinks for zip/7z streaming (async/sync I/O). |
 | `loadFile(path)` / `fromBlob(b)` | Whole-file buffered seekable sources.       |
 | `ouch.walk(options)`         | Async-generator over entries, decoded on demand.         |
 | `ouch.clear()`               | Reset the virtual filesystem.                            |
@@ -148,20 +148,21 @@ authentication).
   reads. Byte sizes are JS `number`s (exact up to 2^53).
 
   File helpers are async by default (sync gets the `Sync` suffix).
-  `fromFile` / `fileSink` open a Deno/Node file handle asynchronously and
-  expose synchronous random access over it (only the *open* blocks the
-  event loop — reads hit the disk at the requested offset, no whole-file
-  load); `fromFileSync` / `fileSinkSync` are the same with a synchronous
-  open. `loadFile` / `readFile` / `writeFile` are the explicit whole-file
-  I/O helpers (use `loadFile` only for moderate files). Deno is detected
-  automatically, then Node's `node:fs` / `node:fs/promises` via
-  `process.getBuiltinModule` (Node ≥ 22.3); pass `node:fs` /
-  `node:fs/promises` (or compatible `SyncFs`/`AsyncFs`) explicitly on older
-  Node / bundlers. Browsers have no file API — use `loadFile` (URLs fall
-  back to `fetch`) or `fromBlob` for a `File`/`Blob`. Note the wasm parsers
-  are synchronous, so random-access reads during parsing use the sync
-  callbacks; the async helpers cover the I/O around them (opening handles,
-  loading inputs, writing outputs).
+  `fromFile` opens a Deno/Node file handle asynchronously and exposes
+  synchronous random access over it (only the *open* blocks the event loop —
+  reads hit the disk at the requested offset, no whole-file load);
+  `fromFileSync` is the same with a synchronous open. `fileSink` is a fully
+  async sink: `writeAt`/`readAt`/`size` are promise-based and never block,
+  and `fileSinkSync` is its synchronous counterpart. `loadFile` /
+  `readFile` / `writeFile` are the explicit whole-file I/O helpers (use
+  `loadFile` only for moderate files). Deno is detected automatically, then
+  Node's `node:fs` / `node:fs/promises` via `process.getBuiltinModule` (Node
+  ≥ 22.3); pass `node:fs` / `node:fs/promises` (or compatible
+  `SyncFs`/`AsyncFs`) explicitly on older Node / bundlers. Browsers have no
+  file API — use `loadFile` (URLs fall back to `fetch`) or `fromBlob` for a
+  `File`/`Blob`. Note the wasm parsers are synchronous, so random-access
+  reads during parsing use the sync callbacks; the async helpers cover the
+  I/O around them (opening handles, loading inputs, writing outputs).
 - **Streaming compression**: `ouch.compressTo(files, writable, options)` (or
   the module-level `compressTo`) pulls each input file from its
   [`SeekableSource`] and pushes 256 KiB output chunks to `writable`, so
@@ -173,7 +174,10 @@ authentication).
   backpressure); `bz2`'s pure-Rust encoder is one-shot, so it uses the
   buffered VFS flow (`compress`) — `compressTo` rejects those with a hint.
   The sinks `fileSink(path)` / `fileSinkSync(path)` are async/sync
-  counterparts of the same handle.
+  counterparts of the same handle: with a sync sink the encoder writes
+  straight to disk (bounded memory), while an async sink buffers the
+  encoder's writes in JS memory and flushes them without blocking — pick
+  `fileSinkSync` for huge archives.
 - `password` enables AES-256 encryption when compressing to zip/7z;
   encrypted archives need it to list, read or extract. `level` (0-9) applies
   to zip (deflate), 7z (LZMA2) and the streaming formats.

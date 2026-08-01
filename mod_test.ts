@@ -901,16 +901,26 @@ Deno.test("fromFile works through a node:fs/promises backend", async () => {
   }
 });
 
-Deno.test("fileSink streams zip compression through an async-opened handle", async () => {
+Deno.test("fileSink is an async seekable sink and streams zip compression", async () => {
   const ouch = await init();
   ouch.clear();
 
-  const a = bytes("async sink zip");
-  const b = noise(256 * 1024);
   const tmp = await Deno.makeTempFile({ suffix: ".zip" });
   try {
     const sink = await fileSink(tmp);
     try {
+      // Async I/O contract: every op returns a Promise and never blocks.
+      await sink.writeAt(0, bytes("async"));
+      await sink.writeAt(5, bytes(" sink"));
+      assertEquals(await sink.size(), 10);
+      assertEquals(text(await sink.readAt(0, 10)), "async sink");
+      // Position-based writes: overwrite in the middle.
+      await sink.writeAt(6, bytes("x"));
+      assertEquals(text(await sink.readAt(0, 10)), "async xink");
+
+      // Streaming zip compression through the async sink.
+      const a = bytes("async sink zip");
+      const b = noise(256 * 1024);
       const chunks: Uint8Array[] = [];
       const result = await ouch.compressTo(
         [
@@ -931,6 +941,23 @@ Deno.test("fileSink streams zip compression through an async-opened handle", asy
       assertEquals(unpacked.files_unpacked, 2);
       assertEquals(ouch.readFile("x/a.txt"), a);
       assertEquals(ouch.readFile("x/b.bin"), b);
+    } finally {
+      await sink.close();
+    }
+  } finally {
+    await Deno.remove(tmp);
+  }
+});
+
+Deno.test("fileSink works through a node:fs/promises backend", async () => {
+  const promises = await import("node:fs/promises");
+  const tmp = await Deno.makeTempFile();
+  try {
+    const sink = await fileSink(tmp, promises as unknown as AsyncFs);
+    try {
+      await sink.writeAt(0, bytes("node async"));
+      assertEquals(await sink.size(), 10);
+      assertEquals(text(await sink.readAt(0, 10)), "node async");
     } finally {
       await sink.close();
     }

@@ -104,6 +104,24 @@ export interface SeekableSink {
 }
 
 /**
+ * The asynchronous counterpart of [`SeekableSink`]: the same random-access
+ * contract, but every operation is promise-based and never blocks the event
+ * loop. Produced by [`fileSink`]. [`Ouch#compressTo`] accepts either sink
+ * type; with an async sink it buffers the wasm encoder's writes in JS memory
+ * (the encoder itself is synchronous) and flushes them asynchronously — for
+ * huge archives prefer the bounded-memory [`fileSinkSync`].
+ */
+export interface AsyncSeekableSink {
+  /** Total bytes written so far. */
+  size(): Promise<number>;
+  /** Write `bytes` at `offset`, resolving with the new end offset. */
+  writeAt(offset: number, bytes: Uint8Array): Promise<number>;
+  /** Read up to `length` bytes starting at `offset` (clamped to EOF). */
+  readAt(offset: number, length: number): Promise<Uint8Array>;
+  close(): Promise<void>;
+}
+
+/**
  * A seekable sink over a Deno/Node file (created/truncated), kept open until
  * `close()` is called. Enables streaming zip/7z compression with bounded
  * memory: the archive is written to disk, then streamed back in chunks. Deno
@@ -265,10 +283,13 @@ function openNodeFile(
 // Async file I/O
 // ---------------------------------------------------------------------------
 //
-// The wasm archive parsers are synchronous, so the random-access sources
-// above must stay synchronous. These async helpers cover the I/O *around*
-// them: whole-file reads/writes without blocking the event loop, and loading
-// files into memory for browsers (no synchronous file API).
+// The wasm archive parsers and encoders are synchronous, so the random-access
+// *sources* must stay synchronous (readAt callbacks run inside wasm calls).
+// The async helpers below cover the I/O around them: opening handles,
+// whole-file reads/writes without blocking the event loop, and loading files
+// into memory for browsers (which have no synchronous file API). Sinks are
+// fully async — the synchronous encoder's writes are buffered and flushed by
+// the JS caller ([`Ouch#compressTo`]), so [`fileSink`] never blocks.
 
 /**
  * The promise-based `fs` API subset used by [`readFile`] /
@@ -285,20 +306,34 @@ export interface AsyncFs {
 
 /** Minimal `node:fs/promises` `FileHandle`-shaped handle. */
 export interface AsyncFileHandle {
-  statSync(): { size: number };
-  readSync(
+  fd?: number;
+  statSync?(): { size: number };
+  readSync?(
     buffer: Uint8Array,
     offset: number,
     length: number,
     position: number,
   ): number;
-  writeSync(
+  writeSync?(
     buffer: Uint8Array,
     offset: number,
     length: number,
     position: number,
   ): number;
-  closeSync(): void;
+  closeSync?(): void;
+  stat?(): Promise<{ size: number }>;
+  read?(
+    buffer: Uint8Array,
+    offset: number,
+    length: number,
+    position: number,
+  ): Promise<{ bytesRead: number; buffer: Uint8Array }>;
+  write?(
+    buffer: Uint8Array,
+    offset: number,
+    length: number,
+    position: number,
+  ): Promise<{ bytesWritten: number; buffer: Uint8Array }>;
   close(): Promise<void>;
 }
 
@@ -346,29 +381,116 @@ export async function fromFile(
 }
 
 /**
- * Asynchronously create a seekable sink over a file — the async counterpart
- * of [`fileSinkSync`]. Streaming zip/7z compression writes into the sink
- * (a Deno/Node file) and the archive is streamed back in chunks, so wasm
- * memory stays bounded. Close the handle with `await sink.close()`.
+ * Asynchronously create a seekable sink over a file (created/truncated) —
+ * the async counterpart of [`fileSinkSync`]. Unlike the sync sink, every
+ * operation is promise-based: `writeAt`/`readAt` use async file I/O and never
+ * block the event loop. Deno is detected automatically; in Node,
+ * `node:fs/promises` is picked up via `process.getBuiltinModule` (or pass
+ * `fs` explicitly). Close the handle with `await sink.close()`.
  */
 export async function fileSink(
   path: string | URL,
   fs?: AsyncFs,
-): Promise<SeekableSink & { close(): Promise<void> }> {
-  const file = await openFileAsync(path, fs, "rw");
+): Promise<AsyncSeekableSink> {
+  if (fs?.open) {
+    return asyncSinkFromHandle(await fs.open(path, "w+"));
+  }
+  const deno = (globalThis as unknown as { Deno?: DenoAsyncOpenLike }).Deno;
+  if (deno?.open) {
+    const file = await deno.open(path, {
+      read: true,
+      write: true,
+      create: true,
+      truncate: true,
+    });
+    return {
+      size: async () => (await file.stat()).size,
+      async writeAt(offset, bytes) {
+        let written = 0;
+        while (written < bytes.length) {
+          await file.seek(offset + written, 0);
+          const n = await file.write(bytes.subarray(written));
+          if (n === 0) throw new Error("short async write");
+          written += n;
+        }
+        return offset + bytes.length;
+      },
+      async readAt(offset, length) {
+        const buf = new Uint8Array(length);
+        let got = 0;
+        while (got < length) {
+          await file.seek(offset + got, 0);
+          const n = await file.read(buf.subarray(got));
+          if (n === null || n === 0) break;
+          got += n;
+        }
+        return buf.slice(0, got);
+      },
+      close: async () => {
+        file.close();
+      },
+    };
+  }
+  const nfs = await nodeAsyncFs();
+  if (nfs?.open) {
+    return asyncSinkFromHandle(await nfs.open(path, "w+"));
+  }
+  throw new Error(
+    "fileSink needs Deno or Node; pass a node:fs/promises-like `fs` in other runtimes",
+  );
+}
+
+/** Adapt a `node:fs/promises` `FileHandle` to an [`AsyncSeekableSink`]. */
+function asyncSinkFromHandle(
+  h: {
+    stat?(): Promise<{ size: number }>;
+    read?(
+      buffer: Uint8Array,
+      offset: number,
+      length: number,
+      position: number,
+    ): Promise<{ bytesRead: number; buffer: Uint8Array }>;
+    write?(
+      buffer: Uint8Array,
+      offset: number,
+      length: number,
+      position: number,
+    ): Promise<{ bytesWritten: number; buffer: Uint8Array }>;
+    close(): Promise<void>;
+  },
+): AsyncSeekableSink {
   return {
-    get size() {
-      return file.statSize();
+    size: async () => (await h.stat!()).size,
+    async writeAt(offset, bytes) {
+      let written = 0;
+      while (written < bytes.length) {
+        const { bytesWritten } = await h.write!(
+          bytes,
+          written,
+          bytes.length - written,
+          offset + written,
+        );
+        if (bytesWritten === 0) throw new Error("short async write");
+        written += bytesWritten;
+      }
+      return offset + bytes.length;
     },
-    writeAt(offset, bytes) {
-      return file.writeAt(offset, bytes);
+    async readAt(offset, length) {
+      const buf = new Uint8Array(length);
+      let got = 0;
+      while (got < length) {
+        const { bytesRead } = await h.read!(
+          buf,
+          got,
+          length - got,
+          offset + got,
+        );
+        if (bytesRead === 0) break; // EOF
+        got += bytesRead;
+      }
+      return buf.slice(0, got);
     },
-    readAt(offset, length) {
-      return file.readAt(offset, length);
-    },
-    close() {
-      return file.close();
-    },
+    close: () => h.close(),
   };
 }
 
@@ -435,6 +557,20 @@ interface DenoOpenLike {
     seekSync(offset: number, mode: number): number;
     readSync(buf: Uint8Array): number | null;
     writeSync(bytes: Uint8Array): number;
+    close(): void;
+  }>;
+}
+
+/** The async `Deno.open` handle shape used by [`fileSink`]. */
+interface DenoAsyncOpenLike {
+  open(
+    path: string | URL,
+    opts: { read: true; write?: true; create?: true; truncate?: true },
+  ): Promise<{
+    stat(): Promise<{ size: number }>;
+    seek(offset: number, mode: number): Promise<number>;
+    read(buf: Uint8Array): Promise<number | null>;
+    write(bytes: Uint8Array): Promise<number>;
     close(): void;
   }>;
 }
@@ -863,8 +999,11 @@ export class Ouch {
    * chunks directly to `writable`; `zip`/`7z` write into `options.sink` (a
    * host-side seekable file, see [`fileSink`] / [`fileSinkSync`]) because
    * their encoders need a seekable output, then stream the file back in
-   * chunks — wasm memory stays bounded either way. `bz2` needs the buffered
-   * VFS flow ([`Ouch#compress`]).
+   * chunks — wasm memory stays bounded either way. With a [`fileSinkSync`]
+   * sink the encode writes straight to disk (bounded JS memory too); with an
+   * async [`fileSink`] sink the encoder's writes are buffered in JS memory
+   * and flushed asynchronously, so prefer the sync sink for huge archives.
+   * `bz2` needs the buffered VFS flow ([`Ouch#compress`]).
    */
   async compressTo(
     files: CompressFile[],
@@ -874,8 +1013,8 @@ export class Ouch {
       format?: string;
       level?: number;
       password?: string;
-      /** Required for zip/7z: a seekable file sink. */
-      sink?: SeekableSink;
+      /** Required for zip/7z: a seekable file sink, sync or async. */
+      sink?: SeekableSink | AsyncSeekableSink;
     },
   ): Promise<CompressResult> {
     const args = new CompressFromArgs(options.output);
@@ -898,29 +1037,55 @@ export class Ouch {
     if (fmt === "zip" || fmt === "7z") {
       if (!options.sink) {
         throw new Error(
-          `${fmt} streaming compression needs a seekable sink (Deno/Node file); pass options.sink = fileSinkSync(path)`,
+          `${fmt} streaming compression needs a seekable sink (Deno/Node file); pass options.sink = fileSinkSync(path) or fileSink(path)`,
         );
       }
-      // Encode into the file, then stream it back in bounded chunks (this
-      // path has real backpressure since the read-back loop is async).
-      const result = wasm.compress_to_sink(
-        fileArgs,
-        args,
-        writeAtOf(options.sink),
-      ) as CompressResult;
       const writer = writable.getWriter();
       try {
-        let offset = 0;
-        while (offset < result.output_size) {
-          const chunk = options.sink.readAt(offset, STREAM_CHUNK);
-          if (chunk.length === 0) break;
-          await writer.write(chunk);
-          offset += chunk.length;
+        let result: CompressResult;
+        if (isAsyncSink(options.sink)) {
+          // The wasm encoder is synchronous, so capture its writes during the
+          // call, then flush them to the async sink (and read the archive
+          // back) without blocking the event loop.
+          const writes: { offset: number; bytes: Uint8Array }[] = [];
+          result = wasm.compress_to_sink(
+            fileArgs,
+            args,
+            (offset: number, bytes: Uint8Array) => {
+              writes.push({ offset, bytes });
+              return offset + bytes.length;
+            },
+          ) as CompressResult;
+          for (const w of writes) {
+            await options.sink.writeAt(w.offset, w.bytes);
+          }
+          let offset = 0;
+          while (offset < result.output_size) {
+            const chunk = await options.sink.readAt(offset, STREAM_CHUNK);
+            if (chunk.length === 0) break;
+            await writer.write(chunk);
+            offset += chunk.length;
+          }
+        } else {
+          // Encode into the file, then stream it back in bounded chunks (this
+          // path has real backpressure since the read-back loop is async).
+          result = wasm.compress_to_sink(
+            fileArgs,
+            args,
+            writeAtOf(options.sink),
+          ) as CompressResult;
+          let offset = 0;
+          while (offset < result.output_size) {
+            const chunk = options.sink.readAt(offset, STREAM_CHUNK);
+            if (chunk.length === 0) break;
+            await writer.write(chunk);
+            offset += chunk.length;
+          }
         }
+        return result;
       } finally {
         writer.releaseLock();
       }
-      return result;
     }
 
     let result!: CompressResult;
@@ -1124,6 +1289,13 @@ function writeAtOf(
   sink: SeekableSink,
 ): (offset: number, bytes: Uint8Array) => number {
   return (offset, bytes) => sink.writeAt(offset, bytes);
+}
+
+/** Narrow a `SeekableSink | AsyncSeekableSink` union to the async side. */
+function isAsyncSink(
+  sink: SeekableSink | AsyncSeekableSink,
+): sink is AsyncSeekableSink {
+  return typeof (sink as AsyncSeekableSink).size === "function";
 }
 
 function lastSegment(path: string): string {
