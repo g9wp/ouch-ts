@@ -25,7 +25,7 @@ Deno.test("deno entry: file helpers backed by Deno APIs", async () => {
     src.close();
 
     const asrc = await denoEntry.fromFile(tmp);
-    assertEquals(text(asrc.readAt(0, 10)), "deno entry");
+    assertEquals(text(await asrc.readAt(0, 10)), "deno entry");
     await asrc.close();
 
     const loaded: SeekableSource = await denoEntry.loadFile(tmp);
@@ -56,7 +56,7 @@ Deno.test("node entry: file helpers backed by node:fs", async () => {
     src.close();
 
     const asrc = await nodeEntry.fromFile(tmp);
-    assertEquals(text(asrc.readAt(0, 10)), "node entry");
+    assertEquals(text(await asrc.readAt(0, 10)), "node entry");
     await asrc.close();
 
     const loaded: SeekableSource = await nodeEntry.loadFile(tmp);

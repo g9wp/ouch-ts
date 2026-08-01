@@ -81,9 +81,11 @@ three entries expose the same `Ouch` API.
 | `ouch.listArchive(options)`  | List archive entries; `bytes`/`readable` decode lazily.  |
 | `ouch.readEntry(archive, e)` | Read one entry's bytes from an archive.                  |
 | `ouch.streamEntry(archive, e)` | **Stream** one entry in bounded chunks (large files).  |
-| `ouch.listFrom(src, opts)`      | List an archive held by a JS-side [`SeekableSource`]. |
-| `ouch.readEntryFrom(src, e)`    | Read one entry via random access (seek, no full load). |
-| `ouch.streamEntryFrom(src, e)`  | Stream one entry from a seekable source in chunks.     |
+| `ouch.listFrom(src, opts)`      | List an archive held by a JS-side source (sync or async). |
+| `ouch.listFromSync(src, opts)`  | Synchronous list from a [`SeekableSource`].        |
+| `ouch.readEntryFrom(src, e)`    | Read one entry via random access (async; seek, no full load). |
+| `ouch.readEntryFromSync(src, e)`| Synchronous read one entry from a [`SeekableSource`]. |
+| `ouch.streamEntryFrom(src, e)`  | Stream one entry from a source (sync or async) in chunks. |
 | `ouch.compressTo(files, w)`     | **Stream**-compress JS-owned files into a writable.   |
 | `readFile/writeFile`          | Async whole-file I/O (Deno / Node / browser fetch).   |
 | `fromFile(path)` / `fromFileSync(path)` | Random-access disk sources (async/sync open). |
@@ -156,33 +158,32 @@ authentication).
   libraries' sequential readers, so they are not random-access.
   `readEntry()` / `entry.bytes` / `decompress()` still materialize the whole
   entry in memory — prefer streaming for anything large.
-- **Random access via `SeekableSource`**: `listFrom` / `readEntryFrom` /
-  `streamEntryFrom` keep the archive on the JS side (`fromBytes`, or the
-  file handles `fromFile`/`fromFileSync` and `fileSink`/`fileSinkSync` in
-  Deno and Node) and wasm pulls only the ranges it needs through a
-  synchronous `readAt(offset, length)` callback. Zip metadata (central
-  directory), tar headers and 7z headers are read by seeking, and a single
-  entry is decompressed by seeking to its data — the whole archive never
-  enters wasm memory. `tar.*` chains decode sequentially; wrapped
-  zip/7z/rar and `rar` (no random-access reader) fall back to whole-source
-  reads. Byte sizes are JS `number`s (exact up to 2^53).
+- **Random access via `SeekableSource` / `AsyncSeekableSource`**: `listFrom` /
+  `readEntryFrom` / `streamEntryFrom` keep the archive on the JS side
+  (`fromBytes`, or the file handles `fromFile`/`fromFileSync` and
+  `fileSink`/`fileSinkSync` in Deno and Node) and wasm pulls only the ranges
+  it needs through a synchronous `readAt(offset, length)` callback. Zip
+  metadata (central directory), tar headers and 7z headers are read by
+  seeking, and a single entry is decompressed by seeking to its data — the
+  whole archive never enters wasm memory. `tar.*` chains decode sequentially;
+  wrapped zip/7z/rar and `rar` (no random-access reader) fall back to
+  whole-source reads. Byte sizes are JS `number`s (exact up to 2^53).
 
   File helpers are async by default (sync gets the `Sync` suffix).
-  `fromFile` opens a Deno/Node file handle asynchronously and exposes
-  synchronous random access over it (only the *open* blocks the event loop —
-  reads hit the disk at the requested offset, no whole-file load);
-  `fromFileSync` is the same with a synchronous open. `fileSink` is a fully
-  async sink: `writeAt`/`readAt`/`size` are promise-based and never block,
-  and `fileSinkSync` is its synchronous counterpart. `loadFile` /
-  `readFile` / `writeFile` are the explicit whole-file I/O helpers (use
-  `loadFile` only for moderate files). Deno is detected automatically, then
-  Node's `node:fs` / `node:fs/promises` via `process.getBuiltinModule` (Node
-  ≥ 22.3); pass `node:fs` / `node:fs/promises` (or compatible
-  `SyncFs`/`AsyncFs`) explicitly on older Node / bundlers. Browsers have no
-  file API — use `loadFile` (URLs fall back to `fetch`) or `fromBlob` for a
-  `File`/`Blob`. Note the wasm parsers are synchronous, so random-access
-  reads during parsing use the sync callbacks; the async helpers cover the
-  I/O around them (opening handles, loading inputs, writing outputs).
+  `fromFile` returns an [`AsyncSeekableSource`] whose `size()`/`readAt()`/
+  `close()` are promise-based and never block the event loop;
+  `fromFileSync` returns a synchronous [`SeekableSource`] (its `readAt` runs
+  inside the wasm parser). `fileSink` is a fully async sink and `fileSinkSync`
+  its synchronous counterpart. The seekable `Ouch` methods and `compressTo`
+  accept either source/sink type; because the wasm parsers are synchronous, an
+  async source or sink is buffered in JS memory before/during the call —
+  prefer the sync variants for huge archives. `loadFile` / `readFile` /
+  `writeFile` are the explicit whole-file I/O helpers (use `loadFile` only for
+  moderate files). Deno is detected automatically, then Node's `node:fs` /
+  `node:fs/promises` via `process.getBuiltinModule` (Node ≥ 22.3); pass
+  `node:fs` / `node:fs/promises` (or compatible `SyncFs`/`AsyncFs`) explicitly
+  on older Node / bundlers. Browsers have no file API — use `loadFile` (URLs
+  fall back to `fetch`) or `fromBlob` for a `File`/`Blob`.
 - **Streaming compression**: `ouch.compressTo(files, writable, options)` (or
   the module-level `compressTo`) pulls each input file from its
   [`SeekableSource`] and pushes 256 KiB output chunks to `writable`, so

@@ -44,17 +44,34 @@ export type OuchFormat =
  * A synchronous random-access byte source. Most archive metadata (zip central
  * directory, tar headers, 7z header) lives at known offsets, and a single
  * entry can be decompressed by seeking to its data — so the whole archive
- * never needs to enter wasm memory. `readAt` must be synchronous; ready-made
- * implementations: [`fromBytes`] (buffers) and [`fromBlob`] (whole Blobs),
- * plus the file sources `fromFileSync`/`fromFile` provided by the runtime
- * entry modules (the universal `mod.ts`, or the `./deno` / `./node`
- * subpath exports).
+ * never needs to enter wasm memory. `readAt` must be synchronous (it runs
+ * inside the synchronous wasm parsers); ready-made implementations:
+ * [`fromBytes`] (buffers), [`fromBlob`] (whole Blobs), and the file source
+ * `fromFileSync` of the runtime entry modules. The asynchronous counterpart
+ * is [`AsyncSeekableSource`]; the `Ouch` seekable methods accept either.
  */
 export interface SeekableSource {
   /** Total byte length of the source. */
   readonly size: number;
   /** Read up to `length` bytes starting at `offset` (clamped to EOF). */
   readAt(offset: number, length: number): Uint8Array;
+}
+
+/**
+ * The asynchronous counterpart of [`SeekableSource`]: the same random-access
+ * contract, but every operation is promise-based and never blocks the event
+ * loop. Produced by the `fromFile` helpers of the runtime entry modules.
+ * The wasm parsers are synchronous, so `Ouch#listFrom` / `Ouch#readEntryFrom`
+ * / `Ouch#streamEntryFrom` buffer an async source in memory before parsing
+ * (like the async sink in `compressTo`); prefer the sync `fromFileSync`
+ * sources for huge archives.
+ */
+export interface AsyncSeekableSource {
+  /** Total byte length of the source. */
+  size(): Promise<number>;
+  /** Read up to `length` bytes starting at `offset` (clamped to EOF). */
+  readAt(offset: number, length: number): Promise<Uint8Array>;
+  close(): Promise<void>;
 }
 
 /** A seekable source over an in-memory byte buffer. */
@@ -122,12 +139,14 @@ export interface CompressOptions {
 /**
  * One input file for streaming compression ([`Ouch#compressTo`]). The bytes
  * are pulled from `source` in bounded chunks; `source.size` must be exact.
+ * An [`AsyncSeekableSource`] is accepted too — it is buffered in memory
+ * before the (synchronous) encoder runs.
  */
 export interface CompressFile {
   /** Path inside the archive. */
   path: string;
   /** File content (a seekable source, e.g. [`fromBytes`] or [`fromFileSync`]). */
-  source: SeekableSource;
+  source: SeekableSource | AsyncSeekableSource;
   /** Unix permission bits (default `0o644`). */
   mode?: number;
   /** Write a directory entry instead of reading `source`. */
@@ -185,7 +204,7 @@ type EntrySource =
   | { kind: "archive"; archive: string; password?: string; format?: string }
   | {
     kind: "seekable";
-    source: SeekableSource;
+    source: SeekableSource | AsyncSeekableSource;
     /** Name used to infer the format for lazy reads (e.g. "archive.zip"). */
     name: string;
     password?: string;
@@ -235,7 +254,12 @@ export class DecompressEntry {
       return this.#ouch.readFile(this.#source.path);
     }
     if (this.#source.kind === "seekable") {
-      return this.#ouch.readEntryFrom(this.#source.source, this.path, {
+      if (isAsyncSource(this.#source.source)) {
+        throw new Error(
+          `entry "${this.path}" has an async source; use readable instead of bytes`,
+        );
+      }
+      return this.#ouch.readEntryFromSync(this.#source.source, this.path, {
         name: this.#source.name,
         password: this.#source.password,
         format: this.#source.format,
@@ -444,16 +468,21 @@ export class Ouch {
     if (options.format !== undefined) args.set_format(options.format);
     if (options.level !== undefined) args.set_level(options.level);
     if (options.password !== undefined) args.set_password(options.password);
-    const fileArgs = files.map((f) => {
-      const a = new CompressFileArgs(
-        f.path,
-        f.isDir ? 0 : f.source.size,
-        readAtOf(f.source),
-      );
-      a.set_mode(f.mode ?? 0o644);
-      if (f.isDir) a.set_dir(true);
-      return a;
-    });
+    // The wasm encoder reads each source synchronously, so async sources are
+    // buffered into memory first (they are only consumed once).
+    const fileArgs = await Promise.all(
+      files.map(async (f) => {
+        const src = f.isDir ? null : await toSyncSource(f.source);
+        const a = new CompressFileArgs(
+          f.path,
+          src ? src.size : 0,
+          src ? readAtOf(src) : EMPTY_READ_AT,
+        );
+        a.set_mode(f.mode ?? 0o644);
+        if (f.isDir) a.set_dir(true);
+        return a;
+      }),
+    );
     const wasm = this.#wasm;
 
     const fmt = (options.format ?? lastSegment(options.output)).toLowerCase();
@@ -577,13 +606,27 @@ export class Ouch {
   // -- seekable (random-access) sources ----------------------------------
 
   /**
-   * List the contents of an archive held by a JS-side [`SeekableSource`].
-   * Only the metadata blocks are pulled from the host (zip central
-   * directory, tar headers, 7z header), so the whole archive never enters
-   * wasm memory. `options.name` (e.g. "archive.zip") is used to infer the
-   * format unless `options.format` is given.
+   * List the contents of an archive held by a JS-side [`SeekableSource`] or
+   * [`AsyncSeekableSource`]. For a sync source only the metadata blocks are
+   * pulled from the host (zip central directory, tar headers, 7z header), so
+   * the whole archive never enters wasm memory. An async source is buffered
+   * in memory first (the wasm parser is synchronous), so prefer sync sources
+   * for huge archives. `options.name` (e.g. "archive.zip") is used to infer
+   * the format unless `options.format` is given. See also [`Ouch#listFromSync`]
+   * for the synchronous variant.
    */
-  listFrom(
+  async listFrom(
+    source: SeekableSource | AsyncSeekableSource,
+    options: { name?: string; format?: string; password?: string } = {},
+  ): Promise<DecompressEntry[]> {
+    return this.listFromSync(
+      await toSyncSource(source),
+      options,
+    );
+  }
+
+  /** Synchronous [`Ouch#listFrom`] for a [`SeekableSource`]. */
+  listFromSync(
     source: SeekableSource,
     options: { name?: string; format?: string; password?: string } = {},
   ): DecompressEntry[] {
@@ -604,9 +647,22 @@ export class Ouch {
     );
   }
 
-  /** Read one entry from an archive held by a JS-side [`SeekableSource`];
-   * only that entry's data is pulled from the host. */
-  readEntryFrom(
+  /**
+   * Read one entry from an archive held by a JS-side [`SeekableSource`] or
+   * [`AsyncSeekableSource`]; only that entry's data is pulled from the host
+   * (async sources are buffered in memory first). See also
+   * [`Ouch#readEntryFromSync`].
+   */
+  async readEntryFrom(
+    source: SeekableSource | AsyncSeekableSource,
+    entry: string,
+    options: { name?: string; format?: string; password?: string } = {},
+  ): Promise<Uint8Array> {
+    return this.readEntryFromSync(await toSyncSource(source), entry, options);
+  }
+
+  /** Synchronous [`Ouch#readEntryFrom`] for a [`SeekableSource`]. */
+  readEntryFromSync(
     source: SeekableSource,
     entry: string,
     options: { name?: string; format?: string; password?: string } = {},
@@ -615,23 +671,27 @@ export class Ouch {
     return this.#wasm.seekable_read_entry(args, readAtOf(source), source.size);
   }
 
-  /** Stream one entry from an archive held by a JS-side [`SeekableSource`]
-   * in bounded chunks (see [`Ouch#streamEntry`]). */
+  /**
+   * Stream one entry from an archive held by a JS-side [`SeekableSource`] or
+   * [`AsyncSeekableSource`] in bounded chunks (see [`Ouch#streamEntry`]).
+   * Async sources are buffered in memory before decoding starts.
+   */
   streamEntryFrom(
-    source: SeekableSource,
+    source: SeekableSource | AsyncSeekableSource,
     entry: string,
     options: { name?: string; format?: string; password?: string } = {},
   ): ReadableStream<Uint8Array> {
     const args = seekableArgs(options, entry);
     const wasm = this.#wasm;
-    const readAt = readAtOf(source);
     return new ReadableStream<Uint8Array>({
-      start: (controller) => {
+      start: async (controller) => {
         try {
+          const src = await toSyncSource(source);
+          const readAt = readAtOf(src);
           wasm.seekable_stream_entry(
             args,
             readAt,
-            source.size,
+            src.size,
             (chunk: Uint8Array) => {
               try {
                 controller.enqueue(chunk);
@@ -721,6 +781,45 @@ function isAsyncSink(
   return typeof (sink as AsyncSeekableSink).size === "function";
 }
 
+/** Narrow a `SeekableSource | AsyncSeekableSource` union to the async side. */
+function isAsyncSource(
+  source: SeekableSource | AsyncSeekableSource,
+): source is AsyncSeekableSource {
+  return typeof (source as AsyncSeekableSource).size === "function";
+}
+
+/**
+ * The wasm parsers are synchronous, so an async source is buffered into
+ * memory before parsing (mirroring the async-sink path in `compressTo`).
+ * Sync sources pass through untouched.
+ */
+async function toSyncSource(
+  source: SeekableSource | AsyncSeekableSource,
+): Promise<SeekableSource> {
+  if (!isAsyncSource(source)) return source;
+  const chunks: Uint8Array[] = [];
+  const size = await source.size();
+  let offset = 0;
+  while (offset < size) {
+    const chunk = await source.readAt(offset, STREAM_CHUNK);
+    if (chunk.length === 0) break;
+    chunks.push(chunk);
+    offset += chunk.length;
+  }
+  return fromBytes(joinChunks(chunks));
+}
+
+function joinChunks(chunks: Uint8Array[]): Uint8Array {
+  const total = chunks.reduce((n, c) => n + c.length, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    out.set(c, offset);
+    offset += c.length;
+  }
+  return out;
+}
+
 function lastSegment(path: string): string {
   const i = path.lastIndexOf(".");
   return i < 0 ? path : path.slice(i + 1);
@@ -728,6 +827,9 @@ function lastSegment(path: string): string {
 
 /** Same as the wasm chunk size: 256 KiB. */
 const STREAM_CHUNK = 256 * 1024;
+
+/** readAt callback for directory entries (never read by the encoder). */
+const EMPTY_READ_AT = () => new Uint8Array(0);
 
 // ---------------------------------------------------------------------------
 // Module-level convenience helpers

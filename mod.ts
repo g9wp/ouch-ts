@@ -10,6 +10,7 @@ export * from "./core.ts";
 import {
   fromBytes,
   type AsyncSeekableSink,
+  type AsyncSeekableSource,
   type SeekableSink,
   type SeekableSource,
 } from "./core.ts";
@@ -272,27 +273,83 @@ export async function writeFile(
 
 /**
  * Asynchronously open a file and return a seekable random-access source —
- * the async counterpart of [`fromFileSync`]. Only the *open* is async:
- * `readAt` stays synchronous (the wasm parsers run synchronously), but every
- * read hits the disk at the requested offset — no whole-file load — so
- * listing a huge archive only touches its header blocks. Deno is detected
- * automatically; in Node, `node:fs/promises` is picked up via
- * `process.getBuiltinModule` (or pass `fs` explicitly). Close the handle with
- * `await src.close()`.
+ * the async counterpart of [`fromFileSync`]: a fully promise-based
+ * random-access source. Every operation is async — `size()`, `readAt()` and
+ * `close()` never block the event loop; reads hit the disk at the requested
+ * offset, no whole-file load. Because the wasm parsers are synchronous, the
+ * seekable `Ouch` methods buffer an async source in memory before parsing;
+ * prefer [`fromFileSync`] for huge archives. Deno is detected automatically;
+ * in Node, `node:fs/promises` is picked up via `process.getBuiltinModule`
+ * (or pass `fs` explicitly).
  */
 export async function fromFile(
   path: string | URL,
   fs?: AsyncFs,
-): Promise<SeekableSource & { close(): Promise<void> }> {
-  const file = await openFileAsync(path, fs, "r");
+): Promise<AsyncSeekableSource> {
+  if (fs?.open) {
+    return asyncSourceFromHandle(await fs.open(path, "r"));
+  }
+  const deno = (globalThis as unknown as { Deno?: DenoAsyncOpenLike }).Deno;
+  if (deno?.open) {
+    const file = await deno.open(path, { read: true });
+    return {
+      size: async () => (await file.stat()).size,
+      async readAt(offset, length) {
+        const buf = new Uint8Array(length);
+        let got = 0;
+        while (got < length) {
+          await file.seek(offset + got, 0);
+          const n = await file.read(buf.subarray(got));
+          if (n === null || n === 0) break;
+          got += n;
+        }
+        return buf.slice(0, got);
+      },
+      close: async () => {
+        file.close();
+      },
+    };
+  }
+  const nfs = await nodeAsyncFs();
+  if (nfs?.open) {
+    return asyncSourceFromHandle(await nfs.open(path, "r"));
+  }
+  throw new Error(
+    "fromFile needs Deno or Node; pass a node:fs/promises-like `fs` in other runtimes",
+  );
+}
+
+/** Adapt a `node:fs/promises` `FileHandle` to an [`AsyncSeekableSource`]. */
+function asyncSourceFromHandle(
+  h: {
+    stat?(): Promise<{ size: number }>;
+    read?(
+      buffer: Uint8Array,
+      offset: number,
+      length: number,
+      position: number,
+    ): Promise<{ bytesRead: number; buffer: Uint8Array }>;
+    close(): Promise<void>;
+  },
+): AsyncSeekableSource {
   return {
-    size: file.statSize(),
-    readAt(offset, length) {
-      return file.readAt(offset, length);
+    size: async () => (await h.stat!()).size,
+    async readAt(offset, length) {
+      const buf = new Uint8Array(length);
+      let got = 0;
+      while (got < length) {
+        const { bytesRead } = await h.read!(
+          buf,
+          got,
+          length - got,
+          offset + got,
+        );
+        if (bytesRead === 0) break; // EOF
+        got += bytesRead;
+      }
+      return buf.slice(0, got);
     },
-    close() {
-      return file.close();
-    },
+    close: () => h.close(),
   };
 }
 
@@ -459,20 +516,7 @@ function nodeAsyncFs(): AsyncFs | undefined {
     | undefined;
 }
 
-interface DenoOpenLike {
-  open(
-    path: string | URL,
-    opts: { read: true; write?: true; create?: true; truncate?: true },
-  ): Promise<{
-    statSync(): { size: number };
-    seekSync(offset: number, mode: number): number;
-    readSync(buf: Uint8Array): number | null;
-    writeSync(bytes: Uint8Array): number;
-    close(): void;
-  }>;
-}
-
-/** The async `Deno.open` handle shape used by [`fileSink`]. */
+/** The async `Deno.open` handle shape used by [`fileSink`] / [`fromFile`]. */
 interface DenoAsyncOpenLike {
   open(
     path: string | URL,
@@ -484,112 +528,4 @@ interface DenoAsyncOpenLike {
     write(bytes: Uint8Array): Promise<number>;
     close(): void;
   }>;
-}
-
-/** Common view over an async-opened Deno file handle or Node FileHandle. */
-interface AsyncOpenHandle {
-  statSize(): number;
-  readAt(offset: number, length: number): Uint8Array;
-  writeAt(offset: number, bytes: Uint8Array): number;
-  close(): Promise<void>;
-}
-
-/**
- * Open a file asynchronously, then adapt it to synchronous random access.
- * An explicitly passed `fs` wins (so Node backends are testable from Deno);
- * otherwise Deno's `Deno.open` and then Node's `fs/promises` are detected.
- */
-async function openFileAsync(
-  path: string | URL,
-  fs: AsyncFs | undefined,
-  mode: "r" | "rw",
-): Promise<AsyncOpenHandle> {
-  if (fs?.open) {
-    return adaptAsyncHandle(await fs.open(path, mode === "rw" ? "w+" : "r"));
-  }
-  const deno = (globalThis as unknown as { Deno?: DenoOpenLike }).Deno;
-  if (deno?.open) {
-    const file = await deno.open(
-      path,
-      mode === "rw"
-        ? { read: true, write: true, create: true, truncate: true }
-        : { read: true },
-    );
-    return {
-      statSize() {
-        return file.statSync().size;
-      },
-      readAt(offset, length) {
-        // Deno.SeekMode.Start === 0
-        file.seekSync(offset, 0);
-        const buf = new Uint8Array(length);
-        const n = file.readSync(buf);
-        return n === null ? new Uint8Array(0) : buf.slice(0, n);
-      },
-      writeAt(offset, bytes) {
-        file.seekSync(offset, 0);
-        file.writeSync(bytes);
-        return offset + bytes.length;
-      },
-      close() {
-        return Promise.resolve(file.close());
-      },
-    };
-  }
-  const nfs = await nodeAsyncFs();
-  if (nfs?.open) {
-    return adaptAsyncHandle(await nfs.open(path, mode === "rw" ? "w+" : "r"));
-  }
-  throw new Error(
-    "fromFile/fileSink need Deno or Node; pass a node:fs/promises-like `fs` in other runtimes",
-  );
-}
-
-/**
- * Adapt a `node:fs/promises` `FileHandle` (or Deno's node-compat handle) to
- * synchronous random access. Real Node (>= 20.1) FileHandles expose
- * `readSync`/`writeSync`/`statSync`; Deno's node-compat FileHandle does not,
- * but it exposes `fd`, so sync reads route through `node:fs` instead.
- */
-function adaptAsyncHandle(handle: unknown): AsyncOpenHandle {
-  const h = handle as {
-    fd?: number;
-    statSync?: () => { size: number };
-    readSync?(
-      buffer: Uint8Array,
-      offset: number,
-      length: number,
-      position: number,
-    ): number;
-    writeSync?(
-      buffer: Uint8Array,
-      offset: number,
-      length: number,
-      position: number,
-    ): number;
-    close(): Promise<void>;
-  };
-  const syncFs = h.readSync ? undefined : nodeFs();
-  const fd = h.fd ?? -1;
-  return {
-    statSize() {
-      if (h.statSync) return h.statSync().size;
-      return syncFs!.fstatSync(fd).size;
-    },
-    readAt(offset, length) {
-      const buf = new Uint8Array(length);
-      const n = h.readSync
-        ? h.readSync(buf, 0, length, offset)
-        : syncFs!.readSync(fd, buf, 0, length, offset);
-      return n <= 0 ? new Uint8Array(0) : buf.slice(0, n);
-    },
-    writeAt(offset, bytes) {
-      if (h.writeSync) h.writeSync(bytes, 0, bytes.length, offset);
-      else syncFs!.writeSync(fd, bytes, 0, bytes.length, offset);
-      return offset + bytes.length;
-    },
-    close() {
-      return h.close();
-    },
-  };
 }

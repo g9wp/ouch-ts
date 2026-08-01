@@ -10,6 +10,7 @@ export * from "./core.ts";
 import {
   fromBytes,
   type AsyncSeekableSink,
+  type AsyncSeekableSource,
   type SeekableSink,
   type SeekableSource,
 } from "./core.ts";
@@ -72,22 +73,33 @@ export function fileSinkSync(
 
 /**
  * Asynchronously open a Node file and return a seekable random-access
- * source — the async counterpart of [`fromFileSync`]. Only the *open* is
- * async: `readAt` stays synchronous (the wasm parsers run synchronously), but
- * every read hits the disk at the requested offset — no whole-file load.
- * Close the handle with `await src.close()`.
+ * source — the async counterpart of [`fromFileSync`]. Every operation is
+ * promise-based: `size()`/`readAt()` use async file I/O and never block the
+ * event loop, and reads hit the disk at the requested offset — no whole-file
+ * load. Because the wasm parsers are synchronous, the seekable `Ouch` methods
+ * buffer an async source in memory before parsing; prefer [`fromFileSync`]
+ * for huge archives. Close the handle with `await src.close()`.
  */
 export async function fromFile(
   path: string | URL,
-): Promise<SeekableSource & { close(): Promise<void> }> {
+): Promise<AsyncSeekableSource> {
   const handle = await openPromise(path, "r");
-  const fd = handle.fd;
   return {
-    size: fstatSync(fd).size,
-    readAt(offset, length) {
+    size: async () => (await handle.stat()).size,
+    async readAt(offset, length) {
       const buf = new Uint8Array(length);
-      const n = readSync(fd, buf, 0, length, offset);
-      return n <= 0 ? new Uint8Array(0) : buf.slice(0, n);
+      let got = 0;
+      while (got < length) {
+        const { bytesRead } = await handle.read(
+          buf,
+          got,
+          length - got,
+          offset + got,
+        );
+        if (bytesRead === 0) break; // EOF
+        got += bytesRead;
+      }
+      return buf.slice(0, got);
     },
     close: () => handle.close(),
   };

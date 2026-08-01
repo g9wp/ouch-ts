@@ -388,12 +388,12 @@ Deno.test("listFrom / readEntryFrom / streamEntryFrom over a byte source", async
   ouch.compress({ files: ["doc.txt"], output: "seek.zip" });
   const src = fromBytes(ouch.readFile("seek.zip"));
 
-  const entries = ouch.listFrom(src, { name: "seek.zip" });
+  const entries = await ouch.listFrom(src, { name: "seek.zip" });
   assertEquals(entries.map((e) => e.path), ["doc.txt"]);
   // Lazy read goes back through the seekable source.
   assertEquals(text(entries[0].bytes), "seekable content");
   assertEquals(
-    text(ouch.readEntryFrom(src, "doc.txt", { name: "seek.zip" })),
+    text(await ouch.readEntryFrom(src, "doc.txt", { name: "seek.zip" })),
     "seekable content",
   );
   const chunks = await collectStream(
@@ -412,15 +412,15 @@ Deno.test("listFrom reads tar metadata via seek (data is skipped)", async () => 
   ouch.compress({ files: ["big.bin", "small.txt"], output: "big.tar" });
   const src = fromBytes(ouch.readFile("big.tar"));
 
-  const entries = ouch.listFrom(src, { name: "big.tar" });
+  const entries = await ouch.listFrom(src, { name: "big.tar" });
   assertEquals(entries.map((e) => e.path).sort(), ["big.bin", "small.txt"]);
   // Reading only the small entry: big.bin's data is skipped by seek.
   assertEquals(
-    text(ouch.readEntryFrom(src, "small.txt", { name: "big.tar" })),
+    text(await ouch.readEntryFrom(src, "small.txt", { name: "big.tar" })),
     "small",
   );
   assertEquals(
-    ouch.readEntryFrom(src, "big.bin", { name: "big.tar" }),
+    await ouch.readEntryFrom(src, "big.bin", { name: "big.tar" }),
     payload,
   );
 });
@@ -433,10 +433,10 @@ Deno.test("listFrom over a 7z source", async () => {
   ouch.compress({ files: ["a.txt"], output: "a.7z" });
   const src = fromBytes(ouch.readFile("a.7z"));
 
-  const entries = ouch.listFrom(src, { name: "a.7z" });
+  const entries = await ouch.listFrom(src, { name: "a.7z" });
   assertEquals(entries.map((e) => e.path), ["a.txt"]);
   assertEquals(
-    text(ouch.readEntryFrom(src, "a.txt", { name: "a.7z" })),
+    text(await ouch.readEntryFrom(src, "a.txt", { name: "a.7z" })),
     "seven",
   );
 });
@@ -454,10 +454,10 @@ Deno.test("fromFileSync reads a zip on disk via random access", async () => {
     await Deno.writeFile(tmp, archiveBytes);
     const src = fromFileSync(tmp);
     try {
-      const entries = ouch.listFrom(src, { name: "disk.zip" });
+      const entries = await ouch.listFrom(src, { name: "disk.zip" });
       assertEquals(entries.map((e) => e.path), ["doc.txt"]);
       assertEquals(
-        text(ouch.readEntryFrom(src, "doc.txt", { name: "disk.zip" })),
+        text(await ouch.readEntryFrom(src, "doc.txt", { name: "disk.zip" })),
         "from file source",
       );
     } finally {
@@ -511,7 +511,7 @@ Deno.test("listFrom reads only metadata, not the whole archive", async () => {
   assert(archive.length > payload.length);
 
   const { source, bytesRead } = countingSource(archive);
-  const entries = ouch.listFrom(source, { name: "big.zip" });
+  const entries = await ouch.listFrom(source, { name: "big.zip" });
   assertEquals(entries.map((e) => e.path), ["big.bin"]);
 
   const read = bytesRead();
@@ -535,7 +535,7 @@ Deno.test("readEntryFrom pulls only the target entry's data", async () => {
   const { source, bytesRead } = countingSource(archive);
   // Reading the small entry must seek over big.bin's 2 MiB of data.
   assertEquals(
-    text(ouch.readEntryFrom(source, "small.txt", { name: "pair.tar" })),
+    text(await ouch.readEntryFrom(source, "small.txt", { name: "pair.tar" })),
     "small",
   );
   const read = bytesRead();
@@ -554,10 +554,10 @@ Deno.test("seekable source handles tar.gz chains", async () => {
   ouch.compress({ files: ["in"], output: "docs.tar.gz" });
   const src = fromBytes(ouch.readFile("docs.tar.gz"));
 
-  const entries = ouch.listFrom(src, { name: "docs.tar.gz" });
+  const entries = await ouch.listFrom(src, { name: "docs.tar.gz" });
   assertEquals(entries.map((e) => e.path).sort(), ["in", "in/doc.txt"]);
   assertEquals(
-    text(ouch.readEntryFrom(src, "in/doc.txt", { name: "docs.tar.gz" })),
+    text(await ouch.readEntryFrom(src, "in/doc.txt", { name: "docs.tar.gz" })),
     text(content),
   );
 });
@@ -570,7 +570,7 @@ Deno.test("seekable source rejects wrapped zip/7z/rar archives", async () => {
   ouch.compress({ files: ["a.txt"], output: "a.zip.gz" });
   const src = fromBytes(ouch.readFile("a.zip.gz"));
 
-  assertThrows(() => ouch.listFrom(src, { name: "a.zip.gz" }));
+  assertRejects(() => ouch.listFrom(src, { name: "a.zip.gz" }));
 });
 
 function collectWritable(chunks: Uint8Array[]): WritableStream<Uint8Array> {
@@ -839,7 +839,7 @@ Deno.test("readFile / writeFile / loadFile roundtrip", async () => {
 
     // loadFile buffers the whole file (explicitly named as such).
     const src = await loadFile(tmp);
-    const entries = ouch.listFrom(src, { name: "a.zip" });
+    const entries = await ouch.listFrom(src, { name: "a.zip" });
     assertEquals(entries.map((e) => e.path), ["a.txt"]);
     assertEquals(text(entries[0].bytes), "async file io");
   } finally {
@@ -865,19 +865,19 @@ Deno.test("fromFile opens a disk handle: random access, no whole-file load", asy
 
     const src = await fromFile(tmp);
     try {
-      assertEquals(src.size, archive.length);
+      assertEquals(await src.size(), archive.length);
       // Live handle: seeking to an arbitrary offset returns those exact bytes.
       const mid = Math.floor(archive.length / 2);
-      assertEquals([...src.readAt(mid, 8)], [...archive.slice(mid, mid + 8)]);
-      assertEquals(src.readAt(archive.length + 10, 16).length, 0);
+      assertEquals([...await src.readAt(mid, 8)], [...archive.slice(mid, mid + 8)]);
+      assertEquals((await src.readAt(archive.length + 10, 16)).length, 0);
 
-      const entries = ouch.listFrom(src, { name: "big.zip" });
+      const entries = await ouch.listFrom(src, { name: "big.zip" });
       assertEquals(entries.map((e) => e.path), ["big.bin"]);
     } finally {
       await src.close();
     }
     // A buffered source would keep working after close; a handle must not.
-    assertThrows(() => src.readAt(0, 4));
+    await assertRejects(() => src.readAt(0, 4));
   } finally {
     await Deno.remove(tmp);
   }
@@ -892,7 +892,7 @@ Deno.test("fromFile works through a node:fs/promises backend", async () => {
     // adapts via `fd` + `node:fs` instead), so cast away the type gap.
     const src = await fromFile(tmp, promises as unknown as AsyncFs);
     try {
-      assertEquals(text(src.readAt(0, 13)), "node promises");
+      assertEquals(text(await src.readAt(0, 13)), "node promises");
     } finally {
       await src.close();
     }
@@ -975,9 +975,75 @@ Deno.test("fromBlob loads a Blob into a seekable source", async () => {
   const blob = new Blob([ouch.readFile("b.zip").buffer as ArrayBuffer]);
 
   const src = await fromBlob(blob);
-  const entries = ouch.listFrom(src, { name: "b.zip" });
+  const entries = await ouch.listFrom(src, { name: "b.zip" });
   assertEquals(entries.map((e) => e.path), ["doc.txt"]);
   assertEquals(text(entries[0].bytes), "blob source");
+});
+
+Deno.test("async source drives listFrom / readEntryFrom / streamEntryFrom", async () => {
+  const ouch = await init();
+  ouch.clear();
+
+  ouch.writeFile("a.txt", bytes("async source content"));
+  ouch.compress({ files: ["a.txt"], output: "as.zip" });
+
+  const tmp = await Deno.makeTempFile({ suffix: ".zip" });
+  try {
+    await Deno.writeFile(tmp, ouch.readFile("as.zip"));
+    const src = await fromFile(tmp);
+    try {
+      assertEquals((await src.size()) > 0, true);
+      const entries = await ouch.listFrom(src, { name: "as.zip" });
+      assertEquals(entries.map((e) => e.path), ["a.txt"]);
+      // listFrom buffered the async source, so lazy `bytes` still works.
+      assertEquals(text(entries[0].bytes), "async source content");
+
+      assertEquals(
+        text(await ouch.readEntryFrom(src, "a.txt", { name: "as.zip" })),
+        "async source content",
+      );
+      assertEquals(
+        text(joinChunks(await collectStream(
+          ouch.streamEntryFrom(src, "a.txt", { name: "as.zip" }),
+        ))),
+        "async source content",
+      );
+    } finally {
+      await src.close();
+    }
+  } finally {
+    await Deno.remove(tmp);
+  }
+});
+
+Deno.test("compressTo reads async input sources", async () => {
+  const ouch = await init();
+  ouch.clear();
+
+  const tmp = await Deno.makeTempFile();
+  try {
+    await Deno.writeFile(tmp, bytes("async compress input"));
+    const src = await fromFile(tmp);
+    try {
+      const chunks: Uint8Array[] = [];
+      await ouch.compressTo(
+        [{ path: "in.txt", source: src }],
+        collectWritable(chunks),
+        { output: "in.tar.gz" },
+      );
+      ouch.writeFile("in.tar.gz", joinChunks(chunks));
+      const unpacked = ouch.decompress({
+        files: ["in.tar.gz"],
+        outputDir: "x",
+      });
+      assertEquals(unpacked.files_unpacked, 1);
+      assertEquals(text(ouch.readFile("x/in.txt")), "async compress input");
+    } finally {
+      await src.close();
+    }
+  } finally {
+    await Deno.remove(tmp);
+  }
 });
 
 function assertThrows(fn: () => unknown): void {
